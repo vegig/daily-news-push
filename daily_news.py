@@ -46,7 +46,7 @@ def fetch_news(category: str, max_articles: int = 10) -> list[dict]:
     url = "https://gnews.io/api/v4/top-headlines"
     params = {
         "category": category,
-        "lang": "zh",           # 中文新闻；如需英文改为 "en"
+        "lang": "en",           # 中文新闻；如需英文改为 "en"
         "max": max_articles,
         "apikey": GNEWS_API_KEY,
     }
