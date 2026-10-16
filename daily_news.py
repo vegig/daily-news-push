@@ -18,11 +18,13 @@ GNEWS_API_KEY = os.environ.get("GNEWS_API_KEY", "")
 
 # 五类新闻配置：标准分类使用 category，关键词搜索使用 q
 CATEGORIES = {
-    "国际重大新闻": "world",       # GNews 标准分类
-    "国内重大新闻": "China",       # 关键词搜索，精准匹配中国新闻
-    "体育新闻": "sports",          # GNews 标准分类
-    "财经新闻": "business",        # GNews 标准分类
-    "娱乐新闻": "entertainment",   # GNews 标准分类
+    "国际重大新闻": "world",
+    "国内重大新闻": "China",
+    "台湾新闻": "Taiwan",     
+    "香港新闻": "Hong Kong",   
+    "体育新闻": "sports",
+    "财经新闻": "business",
+    "娱乐新闻": "entertainment"
 }
 
 # GNews 免费计划单次最大 10 条
@@ -50,16 +52,24 @@ def fetch_news(category: str, max_articles: int = 10) -> list[dict]:
     """调用 GNews API 获取新闻"""
     url = "https://gnews.io/api/v4/top-headlines"
     params = {
-        "lang": "zh",           # 使用英文源，内容更丰富
+        "lang": "zh",           # 建议改回中文，以获取繁体中文新闻
         "max": max_articles,
         "apikey": GNEWS_API_KEY,
     }
 
-    # 判断是标准分类还是关键词搜索
-    if category in GNEWS_STANDARD_CATEGORIES:
+    # 根据分类名称，设置不同的请求参数
+    if category == "台湾新闻":
+        params["country"] = "tw"  # 添加台湾地区代码
+        params["q"] = "台灣"       # 可选：添加关键词让结果更精准
+    elif category == "香港新闻":
+        params["country"] = "hk"  # 添加香港地区代码
+        params["q"] = "香港"       # 可选：添加关键词让结果更精准
+    elif category in GNEWS_STANDARD_CATEGORIES:
         params["category"] = category
     else:
         params["q"] = category
+
+    # ... 后续的请求代码不变
 
     try:
         resp = requests.get(url, params=params, timeout=20)
