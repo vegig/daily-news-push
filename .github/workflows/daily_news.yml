@@ -1,38 +1,31 @@
-name: Daily News Push
+name: Daily AI News Intelligence (WeCom 5-Part)
 
 on:
   schedule:
-    # UTC 0:00 = 北京时间 8:00
-    - cron: '0 0 * * *'
-  workflow_dispatch:   # 支持手动触发，方便测试
+    # UTC 23:30 对应北京时间次日早上 07:30
+    - cron: '30 23 * * *'
+  workflow_dispatch: # 支持手动点击按钮立即测试
 
 jobs:
-  push-news:
+  build-and-push-news:
     runs-on: ubuntu-latest
-
     steps:
-      - name: 检出代码
+      - name: 1. 检出仓库代码
         uses: actions/checkout@v4
 
-      - name: 设置 Python
+      - name: 2. 配置 Python 3.11 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: 安装依赖
+      - name: 3. 安装依赖库
         run: pip install -r requirements.txt
 
-      - name: 运行新闻推送脚本
-        run: python daily_news.py
+      - name: 4. 执行情报抓取、5分类拆分与企微推送
         env:
-          GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
-          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          EMAIL_SMTP_SERVER: ${{ secrets.EMAIL_SMTP_SERVER }}
-          EMAIL_SMTP_PORT: ${{ secrets.EMAIL_SMTP_PORT }}
-          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL }}
+          # 如需在“个人微信-企业微信插件”中直接查看纯文本，可将下方改为 text
+          WECOM_MSG_TYPE: "markdown"
+        run: python main.py
