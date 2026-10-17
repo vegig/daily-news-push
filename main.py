@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -16,6 +17,15 @@ MAX_WECOM_BYTES = 1980
 MAX_ITEMS_PER_FEED = 10
 # 推送格式：可选 "markdown"（企微App内排版最佳）或 "text"（适合个人微信插件直接阅读）
 WECOM_MSG_TYPE = os.environ.get("WECOM_MSG_TYPE", "markdown").lower()
+
+# 模型优先级列表：优先使用报错提示推荐的 gemini-3.8-flash 与官方动态别名 gemini-flash-latest
+CANDIDATE_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-flash-latest",
+    "gemini-3.0-flash",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+]
 
 
 def build_google_news_rss(query: str, lang: str = "en-US", country: str = "US") -> str:
@@ -81,7 +91,6 @@ class DailyIntelligenceReport(BaseModel):
 
 # ==================== 3. 抓取新闻并建立短编号映射 ====================
 def fetch_recent_news() -> tuple[str, dict]:
-    """抓取过去24小时新闻，用 N1, N2... 编号代替长 URL 喂给 AI，节省 Token 并防止链接损坏"""
     print("开始抓取全球 5 大分类新闻源...")
     now = datetime.now(timezone.utc)
     cutoff_time = now - timedelta(hours=26)
@@ -128,12 +137,29 @@ def fetch_recent_news() -> tuple[str, dict]:
         if cat_items:
             collected_sections.append(f"=== 分类候选池：{category_key} ===\n" + "\n".join(cat_items))
 
+    print(f"✅ 新闻抓取完成，共获取 {counter - 1} 条候选新闻。")
     return "\n\n".join(collected_sections), url_map
 
 
-# ==================== 4. 调用 Gemini 生成结构化 5 分类情报 ====================
+# ==================== 4. 调用 Gemini 生成结构化 5 分类情报（支持自动切换模型） ====================
+def discover_available_flash_models(client: genai.Client) -> List[str]:
+    """当预设模型名称发生变更时，动态从 API 查询当前 Key 支持的 Flash 模型"""
+    discovered = []
+    try:
+        for m in client.models.list():
+            name = (m.name or "").removeprefix("models/")
+            # 选择包含 flash 且不包含旧版 2.0/2.5 及语音/图片专用后缀的模型
+            if "flash" in name and not any(
+                skip in name for skip in ["2.0", "2.5", "tts", "image", "audio", "live", "thinking"]
+            ):
+                discovered.append(name)
+    except Exception as e:
+        print(f"[提示] 动态查询模型列表失败: {e}")
+    return discovered
+
+
 def analyze_news_with_ai(raw_news_text: str) -> DailyIntelligenceReport:
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("未检测到 GEMINI_API_KEY 环境变量！")
 
@@ -155,23 +181,40 @@ def analyze_news_with_ai(raw_news_text: str) -> DailyIntelligenceReport:
 3. 语言务必高度凝练！严格遵守每个字段的字数限制，以便单条分类消息控制在企业微信 2048 字节以内。
 """
 
-    print("正在调用 Gemini 2.5 Flash 生成结构化 5 分类情报...")
-    response = client.models.generate_content(
-        model="gemini-flash-latest",
-        contents=f"以下是过去24小时抓取的全球新闻池：\n\n{raw_news_text}",
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.2,
-            response_mime_type="application/json",
-            response_schema=DailyIntelligenceReport,
-        ),
-    )
-    return DailyIntelligenceReport.model_validate_json(response.text)
+    # 合并预设候选模型与动态探测模型
+    models_to_try = list(CANDIDATE_MODELS)
+    for dm in discover_available_flash_models(client):
+        if dm not in models_to_try:
+            models_to_try.append(dm)
+
+    last_error = None
+    for model_name in models_to_try:
+        try:
+            print(f"正在调用模型 [{model_name}] 生成结构化 5 分类情报...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=f"以下是过去24小时抓取的全球新闻池：\n\n{raw_news_text}",
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                    response_schema=DailyIntelligenceReport,
+                ),
+            )
+            print(f"✅ 模型 [{model_name}] 调用成功！")
+            return DailyIntelligenceReport.model_validate_json(response.text)
+        except Exception as e:
+            print(f"⚠️ 模型 [{model_name}] 不可用或调用失败: {e}")
+            last_error = e
+            time.sleep(1.5)
+
+    print(f"❌ 所有候选模型均调用失败，最后报错: {last_error}")
+    sys.exit(1)
 
 
 # ==================== 5. 短链接压缩与 2048 字节安全组装器 ====================
 def shorten_url(long_url: str) -> str:
-    """将冗长的 Google News 链接压缩为约 28 字节的短链，大幅节省字节额度"""
+    """将冗长的 Google News 链接压缩为短链，大幅节省字节额度"""
     if not long_url or len(long_url) <= 60:
         return long_url
     try:
@@ -185,12 +228,10 @@ def shorten_url(long_url: str) -> str:
 
 
 def utf8_len(text: str) -> int:
-    """计算字符串的 UTF-8 字节长度"""
     return len(text.encode("utf-8"))
 
 
 def truncate_to_bytes(text: str, max_bytes: int) -> str:
-    """当极端情况超出字节限制时，按完整字符安全截断，绝不产生乱码"""
     encoded = text.encode("utf-8")
     if len(encoded) <= max_bytes:
         return text
@@ -200,20 +241,17 @@ def truncate_to_bytes(text: str, max_bytes: int) -> str:
 
 
 def build_5_wecom_messages(report: DailyIntelligenceReport, url_map: dict) -> List[str]:
-    """将结构化情报组装为 5 条严格小于 2048 字节的独立消息"""
     beijing_tz = timezone(timedelta(hours=8))
     today_str = datetime.now(beijing_tz).strftime("%m月%d日")
     emojis = {1: "🌍", 2: "📈", 3: "🤖", 4: "🚗", 5: "🏭"}
     messages = []
 
-    # 确保按 1~5 顺序排列
     sorted_categories = sorted(report.categories, key=lambda x: x.category_index)
 
     for idx, cat in enumerate(sorted_categories[:5], start=1):
         emoji = emojis.get(idx, "📌")
         lines = []
 
-        # 1. 消息头部
         if WECOM_MSG_TYPE == "markdown":
             lines.append(f"**【{idx}/5】{emoji} {cat.category_title} ({today_str})**")
             lines.append(f"> 💡 **风向**：{cat.summary_line}")
@@ -221,16 +259,14 @@ def build_5_wecom_messages(report: DailyIntelligenceReport, url_map: dict) -> Li
             lines.append(f"【{idx}/5】{emoji} {cat.category_title} ({today_str})")
             lines.append(f"💡 风向：{cat.summary_line}")
 
-        # 第 1 条消息额外附上全天 3 条最重磅速览
         if idx == 1 and report.top_3_highlights:
             lines.append("")
             lines.append("🔥 **今日全球重磅速览**：" if WECOM_MSG_TYPE == "markdown" else "🔥 今日全球重磅速览：")
-            for h_idx, h_text in enumerate(report.top_3_highlights[:3], start=1):
+            for h_text in report.top_3_highlights[:3]:
                 lines.append(f"• {h_text}")
 
-        lines.append("")  # 空行分隔
+        lines.append("")
 
-        # 2. 逐条组装分类新闻，并动态监控 UTF-8 字节数
         for item_idx, item in enumerate(cat.items, start=1):
             raw_url = url_map.get(item.news_id, "")
             short_link = shorten_url(raw_url)
@@ -261,20 +297,17 @@ def build_5_wecom_messages(report: DailyIntelligenceReport, url_map: dict) -> Li
                 )
 
             current_text = "\n".join(lines)
-            # 优先尝试带链接的版本
             candidate_with_link = f"{current_text}\n\n{item_block_with_link}"
             if utf8_len(candidate_with_link) <= MAX_WECOM_BYTES:
                 lines.append(item_block_with_link)
                 lines.append("")
                 continue
 
-            # 若短链服务超时导致原链接过长，则降级为不带链接版本以保全正文
             candidate_no_link = f"{current_text}\n\n{item_block_no_link}"
             if utf8_len(candidate_no_link) <= MAX_WECOM_BYTES:
                 lines.append(item_block_no_link)
                 lines.append("")
             else:
-                # 兜底截断保护
                 remaining_bytes = MAX_WECOM_BYTES - utf8_len(current_text) - 4
                 if remaining_bytes > 90:
                     lines.append(truncate_to_bytes(item_block_no_link, remaining_bytes))
@@ -288,7 +321,7 @@ def build_5_wecom_messages(report: DailyIntelligenceReport, url_map: dict) -> Li
 
 # ==================== 6. 依次发送 5 条消息至企业微信 ====================
 def push_5_messages_to_wecom(messages: List[str]):
-    webhook_url = os.environ.get("WECOM_WEBHOOK_URL")
+    webhook_url = os.environ.get("WECOM_WEBHOOK_URL", "").strip()
     if not webhook_url:
         raise ValueError("未检测到 WECOM_WEBHOOK_URL 环境变量！")
 
@@ -298,15 +331,9 @@ def push_5_messages_to_wecom(messages: List[str]):
     for idx, msg in enumerate(messages, start=1):
         byte_size = utf8_len(msg)
         if WECOM_MSG_TYPE == "markdown":
-            payload = {
-                "msgtype": "markdown",
-                "markdown": {"content": msg}
-            }
+            payload = {"msgtype": "markdown", "markdown": {"content": msg}}
         else:
-            payload = {
-                "msgtype": "text",
-                "text": {"content": msg}
-            }
+            payload = {"msgtype": "text", "text": {"content": msg}}
 
         resp = requests.post(webhook_url, json=payload, timeout=15)
         resp_json = resp.json() if resp.status_code == 200 else {}
@@ -320,8 +347,8 @@ def push_5_messages_to_wecom(messages: List[str]):
 
         if errcode != 0:
             print(f"[错误告警] 第 {idx} 条消息发送异常，请检查上方返回结果！")
+            sys.exit(1)
 
-        # 间隔 1.5 秒，确保 5 条消息在企业微信群中严格按 [1/5] -> [5/5] 顺序排列
         if idx < total:
             time.sleep(1.5)
 
