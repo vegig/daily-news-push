@@ -10,9 +10,9 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
-# ==================== 1. 全局参数与 8 大分类订阅源配置 ====================
+# ==================== 1. 全局参数与 9 大分类订阅源配置 ====================
 MAX_WECOM_BYTES = 1980  # 严格死守企业微信 text 消息 2048 字节红线
-MAX_ITEMS_PER_FEED = 8   # 分类增加后，每源适当精简条数防溢出
+MAX_ITEMS_PER_FEED = 7   # 分类增加后，每源适当精简条数防溢出
 
 CANDIDATE_MODELS = [
     "gemini-3.8-flash",
@@ -30,7 +30,7 @@ def build_google_news_rss(query: str, lang: str = "en-US", country: str = "US") 
     return f"https://news.google.com/rss/search?q={encoded_query}+when:1d&hl={lang}&gl={country}&ceid={country}:en"
 
 
-# 扩展为 8 大分类的全球多源 RSS
+# 扩展为 9 大分类的全球多源 RSS
 RSS_FEEDS = {
     "1_全球宏观与地缘政经": [
         "http://feeds.bbci.co.uk/news/world/rss.xml",
@@ -52,19 +52,23 @@ RSS_FEEDS = {
         build_google_news_rss("automotive OR EV OR electric vehicle OR powertrain OR battery"),
         build_google_news_rss("新能源汽车 OR 动力电池 OR 电驱 OR 车企 OR 自动驾驶", lang="zh-CN"),
     ],
-    "5_港澳台地区动态": [
+    "5_X平台热点与全网讨论": [
+        build_google_news_rss("site:x.com OR site:twitter.com trending OR viral OR debate OR controversy"),
+        build_google_news_rss("X平台热搜 OR 社交媒体热议 OR 全网讨论 OR 舆论焦点", lang="zh-CN"),
+    ],
+    "6_港澳台地区动态": [
         build_google_news_rss("Hong Kong OR Macau OR Taiwan economy OR cross-strait"),
         build_google_news_rss("香港 OR 澳门 OR 台湾 OR 港澳台 OR 两岸交流", lang="zh-CN"),
     ],
-    "6_全球体育赛事": [
+    "7_全球体育赛事": [
         build_google_news_rss("sports OR football OR basketball OR tennis OR NBA OR Premier League"),
         build_google_news_rss("体育 OR 足球 OR 篮球 OR 网球 OR 奥运 OR 赛事", lang="zh-CN"),
     ],
-    "7_文娱与影视音乐": [
+    "8_文娱与影视音乐": [
         build_google_news_rss("entertainment OR Hollywood OR movies OR box office OR Netflix"),
         build_google_news_rss("娱乐 OR 电影 OR 影视 OR 音乐 OR 票房", lang="zh-CN"),
     ],
-    "8_产业供应链与全球综合": [
+    "9_产业供应链与全球综合": [
         build_google_news_rss("supply chain OR semiconductor manufacturing OR energy transition"),
         build_google_news_rss("供应链 OR 高端制造 OR 能源 OR 国际贸易", lang="zh-CN"),
     ]
@@ -75,15 +79,15 @@ RSS_FEEDS = {
 class NewsItem(BaseModel):
     news_id: str = Field(description="对应原始新闻池中的编号，如 N1, N15")
     title: str = Field(description="中文精炼标题（控制在14-20个汉字以内，不要加星号）")
-    fact: str = Field(description="核心事实与关键数据（控制在35-45个汉字以内）")
-    insight: str = Field(description="行业影响或看点洞察（控制在25-35个汉字以内）")
+    fact: str = Field(description="核心事实或讨论焦点（控制在35-45个汉字以内）")
+    insight: str = Field(description="舆论倾向或行业影响洞察（控制在25-35个汉字以内）")
 
 
 class CategoryBlock(BaseModel):
-    category_index: int = Field(description="分类序号，严格为 1 到 8")
-    category_title: str = Field(description="分类标题，如：全球宏观与地缘政经")
+    category_index: int = Field(description="分类序号，严格为 1 到 9")
+    category_title: str = Field(description="分类标题，如：X平台热点与全网讨论")
     summary_line: str = Field(description="该领域今日一句话风向综述（控制在24个汉字以内）")
-    items: List[NewsItem] = Field(description="该分类下精选的 2 到 3 条核心新闻")
+    items: List[NewsItem] = Field(description="该分类下精选的 2 到 3 条核心热点")
 
 
 class DailyIntelligenceReport(BaseModel):
@@ -91,13 +95,13 @@ class DailyIntelligenceReport(BaseModel):
         description="全天跨领域最重磅的 3 条核心要闻速览，每条控制在 26 个汉字以内"
     )
     categories: List[CategoryBlock] = Field(
-        description="严格按顺序排列的 8 个分类情报块（序号 1 到 8）"
+        description="严格按顺序排列的 9 个分类情报块（序号 1 到 9）"
     )
 
 
 # ==================== 3. 抓取新闻并建立短编号映射 ====================
 def fetch_recent_news() -> tuple[str, dict]:
-    print("开始抓取全球 8 大分类新闻源...")
+    print("开始抓取全球 9 大分类新闻与社交热点源...")
     now = datetime.now(timezone.utc)
     cutoff_time = now - timedelta(hours=26)
 
@@ -143,11 +147,11 @@ def fetch_recent_news() -> tuple[str, dict]:
         if cat_items:
             collected_sections.append(f"=== 分类候选池：{category_key} ===\n" + "\n".join(cat_items))
 
-    print(f"✅ 新闻抓取完成，共获取 {counter - 1} 条候选新闻。")
+    print(f"✅ 新闻抓取完成，共获取 {counter - 1} 条候选新闻与热点话题。")
     return "\n\n".join(collected_sections), url_map
 
 
-# ==================== 4. 调用 Gemini 生成结构化 8 分类情报 ====================
+# ==================== 4. 调用 Gemini 生成结构化 9 分类情报 ====================
 def analyze_news_with_ai(raw_news_text: str) -> DailyIntelligenceReport:
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -157,20 +161,21 @@ def analyze_news_with_ai(raw_news_text: str) -> DailyIntelligenceReport:
     beijing_tz = timezone(timedelta(hours=8))
     today_str = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
 
-    system_prompt = f"""你是一位顶级的全球商业与科技首席情报官。今天是 {today_str}。
-请从用户提供的 8 大分类原始新闻候选池中，跨源去重、剔除噪音，严格输出合法的 JSON 格式情报：
+    system_prompt = f"""你是一位顶级的全球商业、科技与社交舆情首席情报官。今天是 {today_str}。
+请从用户提供的 9 大分类原始新闻与社媒候选池中，跨源去重、剔除噪音，严格输出合法的 JSON 格式情报：
 - 分类 1：全球宏观与地缘政经
 - 分类 2：商业与金融市场
 - 分类 3：科技与人工智能
 - 分类 4：汽车工业与新能源
-- 分类 5：港澳台地区动态
-- 分类 6：全球体育赛事
-- 分类 7：文娱与影视音乐
-- 分类 8：产业供应链与全球综合
+- 分类 5：X平台热点与全网讨论（重点提炼海内外社交媒体上的突发争议、热门话题与公众讨论焦点）
+- 分类 6：港澳台地区动态
+- 分类 7：全球体育赛事
+- 分类 8：文娱与影视音乐
+- 分类 9：产业供应链与全球综合
 
 【核心要求】
-1. `categories` 数组必须严格包含序号 1 到 8 的 8 个分类块。
-2. 每个分类精选 2 到 3 条最具价值的新闻，必须准确填写对应的 `news_id`（如 N12）。
+1. `categories` 数组必须严格包含序号 1 到 9 的 9 个分类块。
+2. 每个分类精选 2 到 3 条最具价值的新闻或热点，必须准确填写对应的 `news_id`（如 N12）。
 3. 所有外文内容必须翻译为地道、专业的中文。
 4. 严格遵守字数限制，保持纯文本干净整洁，不要使用 Markdown 加粗符号（**）。
 """
@@ -179,10 +184,10 @@ def analyze_news_with_ai(raw_news_text: str) -> DailyIntelligenceReport:
     last_error = None
     for model_name in models_to_try:
         try:
-            print(f"正在调用模型 [{model_name}] 生成结构化 8 分类情报...")
+            print(f"正在调用模型 [{model_name}] 生成结构化 9 分类情报...")
             response = client.models.generate_content(
                 model=model_name,
-                contents=f"以下是过去24小时抓取的全球新闻池：\n\n{raw_news_text}",
+                contents=f"以下是过去24小时抓取的全球新闻与社媒池：\n\n{raw_news_text}",
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     temperature=0.2,
@@ -228,21 +233,21 @@ def truncate_to_bytes(text: str, max_bytes: int) -> str:
     return cut_bytes.decode("utf-8", errors="ignore") + "...(详见链接)"
 
 
-def build_8_wechat_text_messages(report: DailyIntelligenceReport, url_map: dict) -> List[str]:
+def build_9_wechat_text_messages(report: DailyIntelligenceReport, url_map: dict) -> List[str]:
     beijing_tz = timezone(timedelta(hours=8))
     today_str = datetime.now(beijing_tz).strftime("%m月%d日")
     
-    # 8 大分类专属 Emoji
-    emojis = {1: "🌍", 2: "📈", 3: "🤖", 4: "🚗", 5: "🇭🇰", 6: "⚽", 7: "🎬", 8: "🏭"}
-    num_icons = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣"}
+    # 9 大分类专属 Emoji
+    emojis = {1: "🌍", 2: "📈", 3: "🤖", 4: "🚗", 5: "🐦", 6: "🇭🇰", 7: "⚽", 8: "🎬", 9: "🏭"}
+    num_icons = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣", 7: "7️⃣", 8: "8️⃣", 9: "9️⃣"}
     messages = []
 
     sorted_categories = sorted(report.categories, key=lambda x: x.category_index)
 
-    for idx, cat in enumerate(sorted_categories[:8], start=1):
+    for idx, cat in enumerate(sorted_categories[:9], start=1):
         emoji = emojis.get(idx, "📌")
         lines = [
-            f"【{idx}/8】{emoji} {cat.category_title} ({today_str})",
+            f"【{idx}/9】{emoji} {cat.category_title} ({today_str})",
             f"💡 风向：{cat.summary_line}",
             "━━━━━━━━━━━━━━"
         ]
@@ -267,13 +272,13 @@ def build_8_wechat_text_messages(report: DailyIntelligenceReport, url_map: dict)
             link_line = f"\n🔗 {short_link}" if short_link else ""
             item_block_with_link = (
                 f"{icon} {clean_title}\n"
-                f"▸ 事实：{clean_fact}\n"
-                f"▸ 洞察：{clean_insight}{link_line}"
+                f"▸ 事实/话题：{clean_fact}\n"
+                f"▸ 舆论/洞察：{clean_insight}{link_line}"
             )
             item_block_no_link = (
                 f"{icon} {clean_title}\n"
-                f"▸ 事实：{clean_fact}\n"
-                f"▸ 洞察：{clean_insight}"
+                f"▸ 事实/话题：{clean_fact}\n"
+                f"▸ 舆论/洞察：{clean_insight}"
             )
 
             current_text = "\n".join(lines)
@@ -291,62 +296,4 @@ def build_8_wechat_text_messages(report: DailyIntelligenceReport, url_map: dict)
                     lines.append(truncate_to_bytes(item_block_no_link, remaining_bytes))
                 break
 
-        header_part = "\n".join(lines[:3])
-        body_items = lines[3:]
-        final_msg = header_part + "\n" + "\n\n".join(body_items)
-        final_msg = truncate_to_bytes(final_msg.strip(), MAX_WECOM_BYTES)
-        messages.append(final_msg)
-
-    return messages
-
-
-# ==================== 6. 依次发送 8 条纯文本消息 ====================
-def push_8_messages_to_wecom(messages: List[str]):
-    webhook_url = os.environ.get("WECOM_WEBHOOK_URL", "").strip()
-    if not webhook_url:
-        raise ValueError("未检测到 WECOM_WEBHOOK_URL 环境变量！")
-
-    total = len(messages)
-    print(f"准备向企业微信/个人微信依次发送 {total} 条分类纯文本消息...")
-
-    for idx, msg in enumerate(messages, start=1):
-        byte_size = utf8_len(msg)
-        payload = {
-            "msgtype": "text",
-            "text": {
-                "content": msg
-            }
-        }
-
-        resp = requests.post(webhook_url, json=payload, timeout=15)
-        resp_json = resp.json() if resp.status_code == 200 else {}
-        errcode = resp_json.get("errcode", -1)
-
-        print(
-            f"-> 第 [{idx}/{total}] 条推送完成 | "
-            f"字节数: {byte_size}/2048 Bytes | "
-            f"状态码: {resp.status_code} | 返回结果: {resp.text}"
-        )
-
-        if errcode != 0:
-            print(f"[错误告警] 第 {idx} 条消息发送异常！")
-            sys.exit(1)
-
-        if idx < total:
-            time.sleep(1.5)
-
-
-def main():
-    raw_news_text, url_map = fetch_recent_news()
-    if not raw_news_text.strip():
-        print("未抓取到有效新闻，程序退出。")
-        return
-
-    report = analyze_news_with_ai(raw_news_text)
-    messages = build_8_wechat_text_messages(report, url_map)
-    push_8_messages_to_wecom(messages)
-    print("✅ 今日 8 大分类情报全部推送完毕！")
-
-
-if __name__ == "__main__":
-    main()
+        header_part
