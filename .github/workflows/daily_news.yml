@@ -1,10 +1,16 @@
-name: Daily AI News Intelligence (WeCom 5-Part)
+name: Daily AI News Intelligence (9AM & 7PM)
 
 on:
   schedule:
-    # UTC 23:30 对应北京时间次日早上 07:30
-    - cron: '30 23 * * *'
+    # 北京时间早上 09:00 (UTC 01:00)
+    - cron: '0 1 * * *'
+    # 北京时间晚上 19:00 (UTC 11:00)
+    - cron: '0 11 * * *'
   workflow_dispatch: # 支持手动点击按钮立即测试
+
+# 赋予工作流将去重记录文件写回仓库的权限
+permissions:
+  contents: write
 
 jobs:
   build-and-push-news:
@@ -22,10 +28,18 @@ jobs:
       - name: 3. 安装依赖库
         run: pip install -r requirements.txt
 
-      - name: 4. 执行情报抓取、5分类拆分与企微推送
+      - name: 4. 执行情报抓取、去重分析与企微推送
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL }}
-          # 如需在“个人微信-企业微信插件”中直接查看纯文本，可将下方改为 text
-          WECOM_MSG_TYPE: "markdown"
         run: python main.py
+
+      - name: 5. 保存已推送记录回仓库（防止晚报与早报重复 + 仓库永久保活）
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          if [ -f sent_history.json ]; then
+            git add sent_history.json
+            git diff --staged --quiet || git commit -m "chore: 自动更新早晚报去重历史记录 [skip ci]"
+            git push
+          fi
