@@ -296,4 +296,62 @@ def build_9_wechat_text_messages(report: DailyIntelligenceReport, url_map: dict)
                     lines.append(truncate_to_bytes(item_block_no_link, remaining_bytes))
                 break
 
-        header_part
+        header_part = "\n".join(lines[:3])
+        body_items = lines[3:]
+        final_msg = header_part + "\n" + "\n\n".join(body_items)
+        final_msg = truncate_to_bytes(final_msg.strip(), MAX_WECOM_BYTES)
+        messages.append(final_msg)
+
+    return messages
+
+
+# ==================== 6. 依次发送 9 条纯文本消息 ====================
+def push_9_messages_to_wecom(messages: List[str]):
+    webhook_url = os.environ.get("WECOM_WEBHOOK_URL", "").strip()
+    if not webhook_url:
+        raise ValueError("未检测到 WECOM_WEBHOOK_URL 环境变量！")
+
+    total = len(messages)
+    print(f"准备向企业微信/个人微信依次发送 {total} 条分类纯文本消息...")
+
+    for idx, msg in enumerate(messages, start=1):
+        byte_size = utf8_len(msg)
+        payload = {
+            "msgtype": "text",
+            "text": {
+                "content": msg
+            }
+        }
+
+        resp = requests.post(webhook_url, json=payload, timeout=15)
+        resp_json = resp.json() if resp.status_code == 200 else {}
+        errcode = resp_json.get("errcode", -1)
+
+        print(
+            f"-> 第 [{idx}/{total}] 条推送完成 | "
+            f"字节数: {byte_size}/2048 Bytes | "
+            f"状态码: {resp.status_code} | 返回结果: {resp.text}"
+        )
+
+        if errcode != 0:
+            print(f"[错误告警] 第 {idx} 条消息发送异常！")
+            sys.exit(1)
+
+        if idx < total:
+            time.sleep(1.5)
+
+
+def main():
+    raw_news_text, url_map = fetch_recent_news()
+    if not raw_news_text.strip():
+        print("未抓取到有效新闻，程序退出。")
+        return
+
+    report = analyze_news_with_ai(raw_news_text)
+    messages = build_9_wechat_text_messages(report, url_map)
+    push_9_messages_to_wecom(messages)
+    print("✅ 今日 9 大分类情报（含 X 平台热点与讨论）全部推送完毕！")
+
+
+if __name__ == "__main__":
+    main()
