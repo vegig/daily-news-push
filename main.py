@@ -12,10 +12,11 @@ from google import genai
 from google.genai import types
 
 # ==================== 1. 全局参数与 9 大分类订阅源配置 ====================
-MAX_WECOM_BYTES = 1980          # 严格死守企业微信 text 消息 2048 字节红线
-MAX_ITEMS_PER_FEED = 8          # 每个订阅源最大提取条数
-HISTORY_FILE = "sent_history.json"  # 本地去重历史记录文件
-HISTORY_RETENTION_HOURS = 48    # 历史记录保留 48 小时，防止跨天重复
+MAX_WECOM_BYTES = 1980          # 企业微信 text 消息 2048 字节红线
+MAX_ITEMS_PER_FEED = 12         # 扩大单源初筛池，方便严格时间过滤后仍有充足新鲜新闻
+MAX_NEWS_AGE_HOURS = 15         # 【硬性红线】只允许过去 15 小时内发布的新闻进入候选池
+HISTORY_FILE = "sent_history.json"
+HISTORY_RETENTION_HOURS = 72    # 历史指纹保留延长至 72 小时（3天），彻底封杀回头草
 
 CANDIDATE_MODELS = [
     "gemini-3.8-flash",
@@ -27,17 +28,22 @@ CANDIDATE_MODELS = [
 
 
 def build_google_news_rss(query: str, lang: str = "en-US", country: str = "US") -> str:
-    encoded_query = urllib.parse.quote(query)
+    """
+    【核心修复】用括号包裹整个 OR 查询语句后再附加 when:1d，
+    防止 when:1d 仅对最后一个 OR 词生效而漏入几个月前的旧闻！
+    """
+    strict_query = f"({query}) when:1d"
+    encoded_query = urllib.parse.quote(strict_query)
     if lang == "zh-CN":
-        return f"https://news.google.com/rss/search?q={encoded_query}+when:1d&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
-    return f"https://news.google.com/rss/search?q={encoded_query}+when:1d&hl={lang}&gl={country}&ceid={country}:en"
+        return f"https://news.google.com/rss/search?q={encoded_query}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+    return f"https://news.google.com/rss/search?q={encoded_query}&hl={lang}&gl={country}&ceid={country}:en"
 
 
 RSS_FEEDS = {
     "1_全球宏观与地缘政经": [
         "http://feeds.bbci.co.uk/news/world/rss.xml",
         "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-        build_google_news_rss("Reuters world OR geopolitics OR central bank"),
+        build_google_news_rss("Reuters OR world OR geopolitics OR central bank"),
     ],
     "2_商业与金融市场": [
         "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
@@ -55,38 +61,39 @@ RSS_FEEDS = {
         build_google_news_rss("新能源汽车 OR 动力电池 OR 电驱 OR 车企 OR 自动驾驶", lang="zh-CN"),
     ],
     "5_X平台热点与全网讨论": [
-        build_google_news_rss("X Twitter viral OR trending OR Elon Musk OR backlash OR debate"),
+        build_google_news_rss("X OR Twitter OR viral OR trending OR Elon Musk OR debate"),
         "https://hnrss.org/frontpage?points=150",
-        build_google_news_rss("热搜 OR 网友热议 OR 舆论 OR 争议 OR 刷屏", lang="zh-CN"),
+        build_google_news_rss("热搜 OR 网友热议 OR 舆论焦点 OR 突发争议", lang="zh-CN"),
     ],
     "6_港澳台地区动态": [
-        build_google_news_rss("Hong Kong OR Macau OR Taiwan economy"),
+        build_google_news_rss("Hong Kong OR Macau OR Taiwan"),
         build_google_news_rss("香港 OR 澳门 OR 台湾 OR 大湾区", lang="zh-CN"),
     ],
     "7_全球体育赛事": [
-        build_google_news_rss("sports OR Champions League OR NBA OR Premier League OR tennis"),
-        build_google_news_rss("体育 OR 足球 OR 篮球 OR 欧冠 OR NBA OR 赛事", lang="zh-CN"),
+        "http://feeds.bbci.co.uk/sport/rss.xml",
+        build_google_news_rss("sports OR Champions League OR NBA OR Premier League OR tennis OR F1"),
+        build_google_news_rss("体育赛事 OR 欧冠 OR 英超 OR NBA OR 网球 OR 夺冠", lang="zh-CN"),
     ],
     "8_文娱与影视音乐": [
-        build_google_news_rss("Hollywood OR box office OR Netflix OR streaming OR celebrity"),
-        build_google_news_rss("娱乐 OR 电影 OR 剧集 OR 票房 OR 演唱会", lang="zh-CN"),
+        "https://variety.com/feed/",
+        "https://www.hollywoodreporter.com/feed/",
+        build_google_news_rss("Hollywood OR box office OR Netflix OR movie release OR concert"),
+        build_google_news_rss("电影票房 OR 新片定档 OR 影视剧 OR 音乐节 OR 演唱会", lang="zh-CN"),
     ],
     "9_产业供应链与全球综合": [
         build_google_news_rss("supply chain OR semiconductor manufacturing OR energy transition"),
-        build_google_news_rss("供应链 OR 高端制造 OR 能源 OR 国际贸易", lang="zh-CN"),
+        build_google_news_rss("供应链 OR 高端制造 OR 能源转型 OR 国际航运", lang="zh-CN"),
     ]
 }
 
 
-# ==================== 2. 新增：历史去重记忆库管理（早晚报防重核心） ====================
+# ==================== 2. 历史去重记忆库管理（保留 72 小时） ====================
 def make_fingerprint(text: str) -> str:
-    """生成新闻标题或链接的唯一 MD5 指纹"""
     clean = "".join(text.lower().split())
     return hashlib.md5(clean.encode("utf-8")).hexdigest()
 
 
 def load_sent_history() -> tuple[set, List[str], dict]:
-    """读取过去 48 小时内已推送过的新闻指纹与 AI 已报标题"""
     now_ts = time.time()
     cutoff_ts = now_ts - (HISTORY_RETENTION_HOURS * 3600)
 
@@ -98,7 +105,6 @@ def load_sent_history() -> tuple[set, List[str], dict]:
         except Exception as e:
             print(f"[提示] 读取历史记录文件异常，将重新初始化: {e}")
 
-    # 仅保留 48 小时以内的有效记录，自动清理过期记录防止文件膨胀
     valid_fps = {
         fp: ts for fp, ts in raw_data.get("fingerprints", {}).items() if ts > cutoff_ts
     }
@@ -106,10 +112,10 @@ def load_sent_history() -> tuple[set, List[str], dict]:
         ev for ev in raw_data.get("reported_events", []) if ev.get("ts", 0) > cutoff_ts
     ]
 
-    recent_ai_titles = [ev["title"] for ev in valid_events[-35:]]
+    recent_ai_titles = [ev["title"] for ev in valid_events[-45:]]
     cleaned_store = {"fingerprints": valid_fps, "reported_events": valid_events}
 
-    print(f"📚 已加载历史去重库：包含 {len(valid_fps)} 条历史原文指纹，{len(recent_ai_titles)} 条近期已报事件。")
+    print(f"📚 已加载历史去重库：{len(valid_fps)} 条原文指纹，{len(recent_ai_titles)} 条近期已推事件。")
     return set(valid_fps.keys()), recent_ai_titles, cleaned_store
 
 
@@ -119,7 +125,6 @@ def save_sent_history(
     used_raw_urls: List[str],
     ai_generated_titles: List[str],
 ):
-    """将本次已推送的新闻写入 sent_history.json，供下一次（如晚报）去重使用"""
     now_ts = time.time()
     fps = history_store.get("fingerprints", {})
     events = history_store.get("reported_events", [])
@@ -135,19 +140,18 @@ def save_sent_history(
             events.append({"title": ai_t, "ts": now_ts})
 
     history_store["fingerprints"] = fps
-    history_store["reported_events"] = events[-80:]  # 最多保留最近80条AI事件标题
+    history_store["reported_events"] = events[-100:]
 
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history_store, f, ensure_ascii=False, indent=2)
     print(f"💾 已更新去重记录库 ({HISTORY_FILE})，新增 {len(ai_generated_titles)} 条已推送事件。")
 
 
-# ==================== 3. 抓取新闻并执行第一重物理过滤 ====================
+# ==================== 3. 严格时间戳校验与新闻抓取 ====================
 def fetch_recent_news(seen_fingerprints: set) -> tuple[str, dict, dict]:
-    print("开始抓取全球 9 大分类新闻与社交热点源...")
+    print(f"开始抓取全球新闻源（严格锁定过去 {MAX_NEWS_AGE_HOURS} 小时内）...")
     now = datetime.now(timezone.utc)
-    # 配合一天两次推送，优先聚焦最近 14 小时内的新鲜资讯
-    cutoff_time = now - timedelta(hours=14)
+    cutoff_time = now - timedelta(hours=MAX_NEWS_AGE_HOURS)
 
     collected_sections = []
     current_run_titles = set()
@@ -155,6 +159,7 @@ def fetch_recent_news(seen_fingerprints: set) -> tuple[str, dict, dict]:
     raw_title_map = {}
     counter = 1
     skipped_history_count = 0
+    skipped_old_or_nodate_count = 0
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -174,19 +179,27 @@ def fetch_recent_news(seen_fingerprints: set) -> tuple[str, dict, dict]:
                     if not title or title in current_run_titles:
                         continue
 
-                    # 【第一重去重】检查是否已在早上（或前一天）推送过
+                    # 1. 【严格时间戳审查】没有明确发布时间、或早于 15 小时前的新闻一律丢弃！
+                    pub_parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+                    if not pub_parsed:
+                        skipped_old_or_nodate_count += 1
+                        continue
+
+                    pub_dt = datetime.fromtimestamp(time.mktime(pub_parsed), tz=timezone.utc)
+                    # 防御未来时间异常或超期旧闻
+                    if pub_dt < cutoff_time or pub_dt > (now + timedelta(hours=2)):
+                        skipped_old_or_nodate_count += 1
+                        continue
+
+                    # 2. 【历史去重审查】已推送过的指纹直接剔除
                     title_fp = make_fingerprint(title)
                     link_fp = make_fingerprint(link) if link else ""
                     if title_fp in seen_fingerprints or (link_fp and link_fp in seen_fingerprints):
                         skipped_history_count += 1
                         continue
 
-                    # 检查发布时间
-                    pub_parsed = entry.get("published_parsed") or entry.get("updated_parsed")
-                    if pub_parsed:
-                        pub_dt = datetime.fromtimestamp(time.mktime(pub_parsed), tz=timezone.utc)
-                        if pub_dt < cutoff_time:
-                            continue
+                    # 计算距离现在几小时，明确标注喂给 AI 接受二次审查
+                    hours_ago = max(0.1, round((now - pub_dt).total_seconds() / 3600, 1))
 
                     current_run_titles.add(title)
                     news_id = f"N{counter}"
@@ -195,21 +208,26 @@ def fetch_recent_news(seen_fingerprints: set) -> tuple[str, dict, dict]:
                     counter += 1
 
                     clean_summary = summary[:140].replace("\n", " ").replace("\r", " ")
-                    cat_items.append(f"[{news_id}] 标题: {title} | 摘要: {clean_summary}")
+                    cat_items.append(
+                        f"[{news_id}] (发布于 {hours_ago}小时前) 标题: {title} | 摘要: {clean_summary}"
+                    )
             except Exception as e:
                 print(f"[警告] 抓取源跳过 ({url[:45]}...): {e}")
 
         if cat_items:
             collected_sections.append(f"=== 分类候选池：{category_key} ===\n" + "\n".join(cat_items))
+        else:
+            print(f"ℹ️ 分类 [{category_key}] 本时段无满足 {MAX_NEWS_AGE_HOURS} 小时内的新鲜资讯。")
 
     print(
-        f"✅ 新闻抓取完成：共获取 {counter - 1} 条全新候选新闻 "
-        f"（已自动拦截过滤 {skipped_history_count} 条往期已推送旧闻）。"
+        f"✅ 抓取与清洗完成：共保留 {counter - 1} 条新鲜资讯 | "
+        f"拦截超期/无日期旧闻: {skipped_old_or_nodate_count} 条 | "
+        f"拦截往期已推重复新闻: {skipped_history_count} 条。"
     )
     return "\n\n".join(collected_sections), url_map, raw_title_map
 
 
-# ==================== 4. 调用 Gemini 生成情报（带第二重语义去重） ====================
+# ==================== 4. 调用 Gemini 生成情报（宁缺毋滥原则） ====================
 def discover_available_flash_models(client: genai.Client) -> List[str]:
     discovered = []
     try:
@@ -225,7 +243,6 @@ def discover_available_flash_models(client: genai.Client) -> List[str]:
 
 
 def get_edition_label() -> tuple[str, str]:
-    """根据北京时间自动判断当前是【早报】还是【晚报】"""
     beijing_tz = timezone(timedelta(hours=8))
     now_bj = datetime.now(beijing_tz)
     date_str = now_bj.strftime("%m月%d日")
@@ -245,26 +262,31 @@ def analyze_news_with_ai(raw_news_text: str, recent_ai_titles: List[str]) -> dic
     beijing_tz = timezone(timedelta(hours=8))
     today_str = datetime.now(beijing_tz).strftime("%Y年%m月%d日 %H:%M")
 
-    # 【第二重去重】将上一期（如早上9点）已发送的标题列表注入给 AI，防止换汤不换药的同事件报道
     dedup_instruction = ""
     if recent_ai_titles:
         joined_titles = "\n".join(f"- {t}" for t in recent_ai_titles)
         dedup_instruction = f"""
 【🚨 跨期严禁重复指令（极重要）】
-以下是上一期（如今日早报）已经向用户推送过的事件清单。
-即使候选池中有其他媒体用不同角度或不同语言再次报道以下同一事件，也**必须坚决剔除**，绝不能重复入选（除非出现了颠覆性的全新反转进展）：
+以下是近期已经向用户推送过的事件清单。
+即使候选池中有其他媒体换角度再次报道以下同一事件，也**必须坚决剔除**，绝不能重复入选：
 {joined_titles}
 """
 
-    system_prompt = f"""你是一位顶级的全球商业、科技与社交舆情首席情报官。当前北京时间是 {today_str}。
-请从用户提供的 9 大分类原始新闻与社媒候选池中，跨源去重、剔除噪音，严格输出 JSON 格式的全球情报。
+    system_prompt = f"""你是一位极其严谨的全球商业、科技与社交舆情首席情报官。当前北京时间是 {today_str}。
+请从用户提供的候选池中，跨源去重、剔除噪音，严格输出 JSON 格式的今日全球情报。
 {dedup_instruction}
+【🚨 宁缺毋滥与反旧闻铁律（最高优先级）】
+1. **严禁编造或使用模型自带记忆**：你只能使用下方候选池中提供带有 `[N数字]` 编号的新闻，严禁脱离候选池自行补充任何新闻！
+2. **严禁拿旧闻或凑数内容糊弄**：仔细检查新闻内容背景，若某条新闻明显是在回顾几个月前的旧事、无营养软文或过度微小的琐事，直接丢弃！
+3. **动态条数（宁缺毋滥）**：
+   - 每个分类最多精选 1 到 3 条真正有价值的新鲜资讯（只有 1 条高质量新闻就只输出 1 条，绝不强行凑满 3 条！）。
+   - 如果某个分类下没有任何值得汇报的新鲜动态，请直接将该分类的 `items` 设为空数组 `[]`，或者干脆不输出该分类！
+
 【必须严格输出的 JSON 格式示例】
 {{
   "top_3_highlights": [
     "本期最重磅要闻1（26字以内）",
-    "本期最重磅要闻2（26字以内）",
-    "本期最重磅要闻3（26字以内）"
+    "本期最重磅要闻2（26字以内）"
   ],
   "categories": [
     {{
@@ -283,19 +305,8 @@ def analyze_news_with_ai(raw_news_text: str, recent_ai_titles: List[str]) -> dic
   ]
 }}
 
-【核心要求】
-1. `categories` 数组必须严格包含序号 1 到 9 的 9 个分类对象，一个都不能少：
-   - 1: 全球宏观与地缘政经
-   - 2: 商业与金融市场
-   - 3: 科技与人工智能
-   - 4: 汽车工业与新能源
-   - 5: X平台热点与全网讨论
-   - 6: 港澳台地区动态
-   - 7: 全球体育赛事
-   - 8: 文娱与影视音乐
-   - 9: 产业供应链与全球综合
-2. 每个分类下的 `items` 精选 2 到 3 条最具价值的新鲜动态，准确填写对应的 `news_id`（如 N12）。
-3. 所有外文内容必须翻译为地道、专业的中文，不要使用 Markdown 加粗星号（**）。
+【分类序号对照表】
+1: 全球宏观与地缘政经 | 2: 商业与金融市场 | 3: 科技与人工智能 | 4: 汽车工业与新能源 | 5: X平台热点与全网讨论 | 6: 港澳台地区动态 | 7: 全球体育赛事 | 8: 文娱与影视音乐 | 9: 产业供应链与全球综合
 """
 
     models_to_try = list(CANDIDATE_MODELS)
@@ -306,13 +317,13 @@ def analyze_news_with_ai(raw_news_text: str, recent_ai_titles: List[str]) -> dic
     last_error = None
     for model_name in models_to_try:
         try:
-            print(f"正在调用模型 [{model_name}] 生成结构化 9 分类情报...")
+            print(f"正在调用模型 [{model_name}] 进行严格筛选（宁缺毋滥模式）...")
             response = client.models.generate_content(
                 model=model_name,
-                contents=f"以下是最新抓取的全球新闻与社媒候选池：\n\n{raw_news_text}",
+                contents=f"以下是过去 {MAX_NEWS_AGE_HOURS} 小时内抓取的新鲜候选池：\n\n{raw_news_text}",
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    temperature=0.2,
+                    temperature=0.1,  # 降低温度，严防幻觉
                     response_mime_type="application/json",
                 ),
             )
@@ -321,9 +332,7 @@ def analyze_news_with_ai(raw_news_text: str, recent_ai_titles: List[str]) -> dic
                 raw_json = raw_json.strip("`").removeprefix("json").strip()
             data = json.loads(raw_json)
             cats = data.get("categories", [])
-            if not cats:
-                raise ValueError("模型返回的 categories 列表为空！")
-            print(f"✅ 模型 [{model_name}] 调用成功！共生成 {len(cats)} 个分类块。")
+            print(f"✅ 模型 [{model_name}] 筛选完成！")
             return data
         except Exception as e:
             print(f"⚠️ 模型 [{model_name}] 调用失败: {e}")
@@ -334,7 +343,7 @@ def analyze_news_with_ai(raw_news_text: str, recent_ai_titles: List[str]) -> dic
     sys.exit(1)
 
 
-# ==================== 5. 短链接压缩与 2048 字节安全组装器 ====================
+# ==================== 5. 动态组装消息（自动剔除空分类，有几条推几条） ====================
 def shorten_url(long_url: str) -> str:
     if not long_url or len(long_url) <= 60:
         return long_url
@@ -361,7 +370,7 @@ def truncate_to_bytes(text: str, max_bytes: int) -> str:
     return cut_bytes.decode("utf-8", errors="ignore") + "...(详见链接)"
 
 
-def build_9_wechat_text_messages(
+def build_dynamic_wechat_messages(
     report: dict, url_map: dict, raw_title_map: dict
 ) -> tuple[List[str], List[str], List[str], List[str]]:
     date_str, edition_tag = get_edition_label()
@@ -374,24 +383,40 @@ def build_9_wechat_text_messages(
     used_raw_urls = []
     ai_generated_titles = []
 
-    categories = report.get("categories", [])
+    raw_categories = report.get("categories", [])
     top_3 = report.get("top_3_highlights", [])
-    sorted_categories = sorted(categories, key=lambda x: x.get("category_index", 99))
-    total_cats = len(sorted_categories[:9])
 
-    for idx, cat in enumerate(sorted_categories[:9], start=1):
-        emoji = emojis.get(idx, "📌")
-        cat_title = str(cat.get("category_title", f"分类情报 {idx}")).replace("**", "")
+    # 【核心过滤】只保留真正有有效新闻（且 news_id 在本次抓取池中真实存在）的分类！
+    valid_categories = []
+    for cat in sorted(raw_categories, key=lambda x: x.get("category_index", 99)):
+        valid_items = []
+        for item in cat.get("items", []):
+            nid = str(item.get("news_id", "")).strip()
+            # 必须是在本次新鲜候选池里真实存在的编号，彻底防死 AI 编造旧闻
+            if nid in url_map:
+                valid_items.append(item)
+        if valid_items:
+            cat["items"] = valid_items
+            valid_categories.append(cat)
+
+    total_cats = len(valid_categories)
+    print(f"📊 经过“宁缺毋滥”过滤后，本期共有 {total_cats} 个分类包含高价值新鲜动态。")
+
+    for msg_idx, cat in enumerate(valid_categories, start=1):
+        cat_idx = cat.get("category_index", msg_idx)
+        emoji = emojis.get(cat_idx, "📌")
+        cat_title = str(cat.get("category_title", f"分类情报 {msg_idx}")).replace("**", "")
         summary_line = str(cat.get("summary_line", "本期重点动态汇总")).replace("**", "")
         items = cat.get("items", [])
 
         lines = [
-            f"【{idx}/{total_cats}】{emoji} {cat_title} ({date_str} {edition_tag})",
+            f"【{msg_idx}/{total_cats}】{emoji} {cat_title} ({date_str} {edition_tag})",
             f"💡 风向：{summary_line}",
             "━━━━━━━━━━━━━━"
         ]
 
-        if idx == 1 and top_3:
+        # 第 1 条消息附带本期全球重磅速览
+        if msg_idx == 1 and top_3:
             lines.append(f"🔥 本期全球重磅速览（{edition_tag}）：")
             for h_text in top_3[:3]:
                 clean_h = str(h_text).replace("**", "")
@@ -399,7 +424,7 @@ def build_9_wechat_text_messages(
             lines.append("━━━━━━━━━━━━━━")
 
         for item_idx, item in enumerate(items, start=1):
-            news_id = str(item.get("news_id", ""))
+            news_id = str(item.get("news_id", "")).strip()
             raw_url = url_map.get(news_id, "")
             raw_title = raw_title_map.get(news_id, "")
             short_link = shorten_url(raw_url)
@@ -409,7 +434,6 @@ def build_9_wechat_text_messages(
             clean_fact = str(item.get("fact", "")).replace("**", "")
             clean_insight = str(item.get("insight", "")).replace("**", "")
 
-            # 记录本次被选中的新闻，供下一次推送时去重
             if raw_title:
                 used_raw_titles.append(raw_title)
             if raw_url:
@@ -453,8 +477,8 @@ def build_9_wechat_text_messages(
     return messages, used_raw_titles, used_raw_urls, ai_generated_titles
 
 
-# ==================== 6. 依次发送 9 条纯文本消息 ====================
-def push_9_messages_to_wecom(messages: List[str]):
+# ==================== 6. 依次发送消息至企业微信/个人微信 ====================
+def push_messages_to_wecom(messages: List[str]):
     webhook_url = os.environ.get("WECOM_WEBHOOK_URL", "").strip()
     if not webhook_url:
         print("❌ [错误] 未检测到 WECOM_WEBHOOK_URL 环境变量！")
@@ -462,8 +486,8 @@ def push_9_messages_to_wecom(messages: List[str]):
 
     total = len(messages)
     if total == 0:
-        print("❌ [错误] 组装出的消息列表为空（0条），终止发送并报错！")
-        sys.exit(1)
+        print("⚠️ 本期经过严格过滤后无值得推送的新鲜重磅消息，跳过推送。")
+        return
 
     print(f"准备向企业微信/个人微信依次发送 {total} 条分类纯文本消息...")
 
@@ -498,29 +522,30 @@ def main():
     date_str, edition_tag = get_edition_label()
     print(f"========== 启动全球情报系统 ({date_str} {edition_tag}) ==========")
 
-    # 1. 加载过去 48 小时已推送记录
+    # 1. 加载过去 72 小时已推送记录
     seen_fingerprints, recent_ai_titles, history_store = load_sent_history()
 
-    # 2. 抓取最新新闻并剔除历史已发原文
+    # 2. 抓取过去 15 小时内的新鲜新闻（物理剔除无日期、超期及已推新闻）
     raw_news_text, url_map, raw_title_map = fetch_recent_news(seen_fingerprints)
     if not raw_news_text.strip():
-        print("⚠️ 本时段没有抓取到任何未推送过的新闻，程序结束。")
+        print("⚠️ 本时段没有抓取到任何满足 15 小时内的新鲜未推新闻，程序正常结束。")
         return
 
-    # 3. AI 筛选分析（注入上一期标题列表进行跨事件语义去重）
+    # 3. AI 筛选分析（宁缺毋滥模式，允许缺省无动态分类）
     report = analyze_news_with_ai(raw_news_text, recent_ai_titles)
 
-    # 4. 组装 9 条消息并收集本次已使用的标题与链接
-    messages, used_raw_titles, used_raw_urls, ai_titles = build_9_wechat_text_messages(
+    # 4. 动态组装非空分类消息（校验 news_id 真实性，有几个分类推几条）
+    messages, used_raw_titles, used_raw_urls, ai_titles = build_dynamic_wechat_messages(
         report, url_map, raw_title_map
     )
 
     # 5. 推送至企业微信/个人微信
-    push_9_messages_to_wecom(messages)
+    push_messages_to_wecom(messages)
 
-    # 6. 推送成功后，将本期新闻写入 sent_history.json 供下一次去重
-    save_sent_history(history_store, used_raw_titles, used_raw_urls, ai_titles)
-    print(f"🎉 {date_str} {edition_tag} 9 大分类情报全部推送并归档完毕！")
+    # 6. 保存已推送记录
+    if ai_titles:
+        save_sent_history(history_store, used_raw_titles, used_raw_urls, ai_titles)
+    print(f"🎉 {date_str} {edition_tag} 情报任务执行完毕！")
 
 
 if __name__ == "__main__":
