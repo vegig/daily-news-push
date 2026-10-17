@@ -11,14 +11,12 @@ from google import genai
 from google.genai import types
 
 # ==================== 1. 全局参数与 5 大分类订阅源配置 ====================
-# 企业微信单条硬性上限为 2048 字节，这里设置 1980 字节作为安全红线
+# 企业微信 text 消息单条硬性上限为 2048 字节，这里设置 1980 字节作为安全红线
 MAX_WECOM_BYTES = 1980
 # 每个 RSS 源提取的最大候选条数
 MAX_ITEMS_PER_FEED = 10
-# 推送格式：可选 "markdown"（企微App内排版最佳）或 "text"（适合个人微信插件直接阅读）
-WECOM_MSG_TYPE = os.environ.get("WECOM_MSG_TYPE", "markdown").lower()
 
-# 模型优先级列表：优先使用报错提示推荐的 gemini-3.8-flash 与官方动态别名 gemini-flash-latest
+# 模型优先级列表（自动容错切换）
 CANDIDATE_MODELS = [
     "gemini-3.8-flash",
     "gemini-flash-latest",
@@ -68,21 +66,21 @@ RSS_FEEDS = {
 # ==================== 2. 定义 Gemini 结构化输出 Schema ====================
 class NewsItem(BaseModel):
     news_id: str = Field(description="对应原始新闻池中的编号，如 N1, N15")
-    title: str = Field(description="中文精炼标题（控制在14-22个汉字以内）")
-    fact: str = Field(description="核心事实与关键数据（控制在40-55个汉字以内，精炼准确）")
-    insight: str = Field(description="商业或行业影响洞察（控制在25-40个汉字以内，一针见血）")
+    title: str = Field(description="中文精炼标题（控制在14-20个汉字以内，不要加星号）")
+    fact: str = Field(description="核心事实与关键数据（控制在40-50个汉字以内，精炼准确）")
+    insight: str = Field(description="商业或行业影响洞察（控制在25-38个汉字以内，一针见血）")
 
 
 class CategoryBlock(BaseModel):
     category_index: int = Field(description="分类序号，严格为 1 到 5")
     category_title: str = Field(description="分类标题，如：全球宏观与地缘政经")
-    summary_line: str = Field(description="该领域今日一句话风向综述（控制在28个汉字以内）")
+    summary_line: str = Field(description="该领域今日一句话风向综述（控制在26个汉字以内）")
     items: List[NewsItem] = Field(description="该分类下精选的 3 到 4 条核心新闻")
 
 
 class DailyIntelligenceReport(BaseModel):
     top_3_highlights: List[str] = Field(
-        description="全天跨领域最重磅的 3 条核心要闻速览，每条控制在 30 个汉字以内"
+        description="全天跨领域最重磅的 3 条核心要闻速览，每条控制在 28 个汉字以内"
     )
     categories: List[CategoryBlock] = Field(
         description="严格按顺序排列的 5 个分类情报块（序号 1 到 5）"
@@ -141,14 +139,12 @@ def fetch_recent_news() -> tuple[str, dict]:
     return "\n\n".join(collected_sections), url_map
 
 
-# ==================== 4. 调用 Gemini 生成结构化 5 分类情报（支持自动切换模型） ====================
+# ==================== 4. 调用 Gemini 生成结构化 5 分类情报 ====================
 def discover_available_flash_models(client: genai.Client) -> List[str]:
-    """当预设模型名称发生变更时，动态从 API 查询当前 Key 支持的 Flash 模型"""
     discovered = []
     try:
         for m in client.models.list():
             name = (m.name or "").removeprefix("models/")
-            # 选择包含 flash 且不包含旧版 2.0/2.5 及语音/图片专用后缀的模型
             if "flash" in name and not any(
                 skip in name for skip in ["2.0", "2.5", "tts", "image", "audio", "live", "thinking"]
             ):
@@ -178,10 +174,9 @@ def analyze_news_with_ai(raw_news_text: str) -> DailyIntelligenceReport:
 【核心要求】
 1. 每个分类精选 3 到 4 条最具价值的新闻，必须准确填写对应的 `news_id`（如 N12）。
 2. 所有外文内容必须翻译为地道、专业的中文（保留关键行业缩写如 OEM、800V、Fed、LLM、M&A 等）。
-3. 语言务必高度凝练！严格遵守每个字段的字数限制，以便单条分类消息控制在企业微信 2048 字节以内。
+3. 严禁在文本中使用 Markdown 加粗符号（如 **），保持纯文本干净整洁，严格遵守字数限制以控制在 2048 字节以内。
 """
 
-    # 合并预设候选模型与动态探测模型
     models_to_try = list(CANDIDATE_MODELS)
     for dm in discover_available_flash_models(client):
         if dm not in models_to_try:
@@ -212,9 +207,9 @@ def analyze_news_with_ai(raw_news_text: str) -> DailyIntelligenceReport:
     sys.exit(1)
 
 
-# ==================== 5. 短链接压缩与 2048 字节安全组装器 ====================
+# ==================== 5. 个人微信纯文本排版与 2048 字节安全组装器 ====================
 def shorten_url(long_url: str) -> str:
-    """将冗长的 Google News 链接压缩为短链，大幅节省字节额度"""
+    """将冗长的 Google News 链接压缩为短链，方便个人微信直接点击并节省字节"""
     if not long_url or len(long_url) <= 60:
         return long_url
     try:
@@ -235,105 +230,101 @@ def truncate_to_bytes(text: str, max_bytes: int) -> str:
     encoded = text.encode("utf-8")
     if len(encoded) <= max_bytes:
         return text
-    suffix = "...(详见原文)".encode("utf-8")
+    suffix = "...(详见链接)".encode("utf-8")
     cut_bytes = encoded[: max_bytes - len(suffix)]
-    return cut_bytes.decode("utf-8", errors="ignore") + "...(详见原文)"
+    return cut_bytes.decode("utf-8", errors="ignore") + "...(详见链接)"
 
 
-def build_5_wecom_messages(report: DailyIntelligenceReport, url_map: dict) -> List[str]:
+def build_5_wechat_text_messages(report: DailyIntelligenceReport, url_map: dict) -> List[str]:
+    """专为个人微信设计的纯文本精排格式，严格小于 2048 字节"""
     beijing_tz = timezone(timedelta(hours=8))
     today_str = datetime.now(beijing_tz).strftime("%m月%d日")
     emojis = {1: "🌍", 2: "📈", 3: "🤖", 4: "🚗", 5: "🏭"}
+    num_icons = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣"}
     messages = []
 
     sorted_categories = sorted(report.categories, key=lambda x: x.category_index)
 
     for idx, cat in enumerate(sorted_categories[:5], start=1):
         emoji = emojis.get(idx, "📌")
-        lines = []
+        lines = [
+            f"【{idx}/5】{emoji} {cat.category_title} ({today_str})",
+            f"💡 风向：{cat.summary_line}",
+            "━━━━━━━━━━━━━━"
+        ]
 
-        if WECOM_MSG_TYPE == "markdown":
-            lines.append(f"**【{idx}/5】{emoji} {cat.category_title} ({today_str})**")
-            lines.append(f"> 💡 **风向**：{cat.summary_line}")
-        else:
-            lines.append(f"【{idx}/5】{emoji} {cat.category_title} ({today_str})")
-            lines.append(f"💡 风向：{cat.summary_line}")
-
+        # 第 1 条消息附带今日全球 3 条重磅速览
         if idx == 1 and report.top_3_highlights:
-            lines.append("")
-            lines.append("🔥 **今日全球重磅速览**：" if WECOM_MSG_TYPE == "markdown" else "🔥 今日全球重磅速览：")
+            lines.append("🔥 今日全球重磅速览：")
             for h_text in report.top_3_highlights[:3]:
-                lines.append(f"• {h_text}")
-
-        lines.append("")
+                clean_h = h_text.replace("**", "")
+                lines.append(f"• {clean_h}")
+            lines.append("━━━━━━━━━━━━━━")
 
         for item_idx, item in enumerate(cat.items, start=1):
             raw_url = url_map.get(item.news_id, "")
             short_link = shorten_url(raw_url)
+            icon = num_icons.get(item_idx, f"{item_idx}.")
 
-            if WECOM_MSG_TYPE == "markdown":
-                link_part = f" [原文]({short_link})" if short_link else ""
-                item_block_with_link = (
-                    f"**{item_idx}. {item.title}**{link_part}\n"
-                    f"- **事实**：{item.fact}\n"
-                    f"- **洞察**：{item.insight}"
-                )
-                item_block_no_link = (
-                    f"**{item_idx}. {item.title}**\n"
-                    f"- **事实**：{item.fact}\n"
-                    f"- **洞察**：{item.insight}"
-                )
-            else:
-                link_part = f"\n🔗 {short_link}" if short_link else ""
-                item_block_with_link = (
-                    f"{item_idx}. 【{item.title}】\n"
-                    f"• 事实：{item.fact}\n"
-                    f"• 洞察：{item.insight}{link_part}"
-                )
-                item_block_no_link = (
-                    f"{item_idx}. 【{item.title}】\n"
-                    f"• 事实：{item.fact}\n"
-                    f"• 洞察：{item.insight}"
-                )
+            clean_title = item.title.replace("**", "")
+            clean_fact = item.fact.replace("**", "")
+            clean_insight = item.insight.replace("**", "")
+
+            link_line = f"\n🔗 {short_link}" if short_link else ""
+            item_block_with_link = (
+                f"{icon} {clean_title}\n"
+                f"▸ 事实：{clean_fact}\n"
+                f"▸ 洞察：{clean_insight}{link_line}"
+            )
+            item_block_no_link = (
+                f"{icon} {clean_title}\n"
+                f"▸ 事实：{clean_fact}\n"
+                f"▸ 洞察：{clean_insight}"
+            )
 
             current_text = "\n".join(lines)
             candidate_with_link = f"{current_text}\n\n{item_block_with_link}"
             if utf8_len(candidate_with_link) <= MAX_WECOM_BYTES:
                 lines.append(item_block_with_link)
-                lines.append("")
                 continue
 
             candidate_no_link = f"{current_text}\n\n{item_block_no_link}"
             if utf8_len(candidate_no_link) <= MAX_WECOM_BYTES:
                 lines.append(item_block_no_link)
-                lines.append("")
             else:
                 remaining_bytes = MAX_WECOM_BYTES - utf8_len(current_text) - 4
                 if remaining_bytes > 90:
                     lines.append(truncate_to_bytes(item_block_no_link, remaining_bytes))
                 break
 
-        final_msg = truncate_to_bytes("\n".join(lines).strip(), MAX_WECOM_BYTES)
+        # 将各新闻块之间用空行优雅隔开
+        header_part = "\n".join(lines[:3])
+        body_items = lines[3:]
+        final_msg = header_part + "\n" + "\n\n".join(body_items)
+        final_msg = truncate_to_bytes(final_msg.strip(), MAX_WECOM_BYTES)
         messages.append(final_msg)
 
     return messages
 
 
-# ==================== 6. 依次发送 5 条消息至企业微信 ====================
+# ==================== 6. 使用 text 类型依次发送 5 条消息（个人微信直接可读） ====================
 def push_5_messages_to_wecom(messages: List[str]):
     webhook_url = os.environ.get("WECOM_WEBHOOK_URL", "").strip()
     if not webhook_url:
         raise ValueError("未检测到 WECOM_WEBHOOK_URL 环境变量！")
 
     total = len(messages)
-    print(f"准备向企业微信依次发送 {total} 条分类消息（模式: {WECOM_MSG_TYPE}）...")
+    print(f"准备向个人微信/企业微信依次发送 {total} 条纯文本消息 (msgtype=text)...")
 
     for idx, msg in enumerate(messages, start=1):
         byte_size = utf8_len(msg)
-        if WECOM_MSG_TYPE == "markdown":
-            payload = {"msgtype": "markdown", "markdown": {"content": msg}}
-        else:
-            payload = {"msgtype": "text", "text": {"content": msg}}
+        # 强制使用个人微信完全支持的 text 类型
+        payload = {
+            "msgtype": "text",
+            "text": {
+                "content": msg
+            }
+        }
 
         resp = requests.post(webhook_url, json=payload, timeout=15)
         resp_json = resp.json() if resp.status_code == 200 else {}
@@ -360,9 +351,9 @@ def main():
         return
 
     report = analyze_news_with_ai(raw_news_text)
-    messages = build_5_wecom_messages(report, url_map)
+    messages = build_5_wechat_text_messages(report, url_map)
     push_5_messages_to_wecom(messages)
-    print("✅ 今日 5 条分类情报全部推送完毕！")
+    print("✅ 今日 5 条分类情报（个人微信兼容版）全部推送完毕！")
 
 
 if __name__ == "__main__":
