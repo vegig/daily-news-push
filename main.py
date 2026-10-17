@@ -157,7 +157,7 @@ def analyze_news_with_ai(raw_news_text: str) -> DailyIntelligenceReport:
 
     print("正在调用 Gemini 2.5 Flash 生成结构化 5 分类情报...")
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",
         contents=f"以下是过去24小时抓取的全球新闻池：\n\n{raw_news_text}",
         config=types.GenerateContentConfig(
             system_instruction=system_prompt,
