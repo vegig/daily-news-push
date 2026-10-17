@@ -1,216 +1,341 @@
-#!/usr/bin/env python3
-"""每日新闻推送脚本 —— 通过 GNews API 获取五类新闻并推送"""
-
 import os
 import time
-import hmac
-import hashlib
-import base64
-import smtplib
+import urllib.parse
+from datetime import datetime, timezone, timedelta
+from typing import List
+import feedparser
 import requests
-from datetime import datetime, timezone
-from email.mime.text import MIMEText
-from email.header import Header
+from pydantic import BaseModel, Field
+from google import genai
+from google.genai import types
 
-# ========== 配置区 ==========
-# 强制从环境变量读取，绝对不要写在代码里！
-GNEWS_API_KEY = os.environ.get("GNEWS_API_KEY", "")
+# ==================== 1. 全局参数与 5 大分类订阅源配置 ====================
+# 企业微信单条硬性上限为 2048 字节，这里设置 1980 字节作为安全红线
+MAX_WECOM_BYTES = 1980
+# 每个 RSS 源提取的最大候选条数
+MAX_ITEMS_PER_FEED = 10
+# 推送格式：可选 "markdown"（企微App内排版最佳）或 "text"（适合个人微信插件直接阅读）
+WECOM_MSG_TYPE = os.environ.get("WECOM_MSG_TYPE", "markdown").lower()
 
-# 五类新闻配置：标准分类使用 category，关键词搜索使用 q
-CATEGORIES = {
-    "国际重大新闻": "world",
-    "国内重大新闻": "China",
-    "台湾新闻": "Taiwan",     
-    "香港新闻": "Hong Kong",   
-    "体育新闻": "sports",
-    "财经新闻": "business",
-    "娱乐新闻": "entertainment"
+
+def build_google_news_rss(query: str, lang: str = "en-US", country: str = "US") -> str:
+    """构造 Google News 过去 24 小时关键词动态 RSS"""
+    encoded_query = urllib.parse.quote(query)
+    if lang == "zh-CN":
+        return f"https://news.google.com/rss/search?q={encoded_query}+when:1d&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+    return f"https://news.google.com/rss/search?q={encoded_query}+when:1d&hl={lang}&gl={country}&ceid={country}:en"
+
+
+# 严格对应 5 条独立消息的 5 大分类源
+RSS_FEEDS = {
+    "1_全球宏观与地缘政经": [
+        "http://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        build_google_news_rss("site:reuters.com world OR geopolitics OR central bank"),
+    ],
+    "2_商业与金融市场": [
+        "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+        build_google_news_rss("Wall Street OR global markets OR M&A OR earnings"),
+        build_google_news_rss("宏观经济 OR 金融市场 OR 财报 OR 并购", lang="zh-CN"),
+    ],
+    "3_科技与人工智能": [
+        "https://techcrunch.com/feed/",
+        "https://www.theverge.com/rss/index.xml",
+        "https://36kr.com/feed",
+        "https://www.ithome.com/rss/",
+    ],
+    "4_汽车工业与新能源": [
+        build_google_news_rss("automotive OR EV OR electric vehicle OR powertrain OR battery"),
+        build_google_news_rss("新能源汽车 OR 动力电池 OR 电驱 OR 车企 OR 自动驾驶", lang="zh-CN"),
+    ],
+    "5_产业供应链与全球综合": [
+        build_google_news_rss("supply chain OR semiconductor manufacturing OR energy transition OR shipping"),
+        build_google_news_rss("供应链 OR 高端制造 OR 能源 OR 国际贸易", lang="zh-CN"),
+    ]
 }
 
-# GNews 免费计划单次最大 10 条
-MAX_PER_CATEGORY = 10
 
-# 推送渠道配置（按需配置）
-WECOM_WEBHOOK = os.environ.get("WECOM_WEBHOOK", "")
-FEISHU_WEBHOOK = os.environ.get("FEISHU_WEBHOOK", "")
-FEISHU_SECRET = os.environ.get("FEISHU_SECRET", "")
-EMAIL_SMTP_SERVER = os.environ.get("EMAIL_SMTP_SERVER", "")
-EMAIL_SMTP_PORT = int(os.environ.get("EMAIL_SMTP_PORT") or "465")
-EMAIL_USERNAME = os.environ.get("EMAIL_USERNAME", "")
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "")
-EMAIL_TO = os.environ.get("EMAIL_TO", "")
-
-# GNews 标准分类列表，用于判断使用 category 还是 q 参数
-GNEWS_STANDARD_CATEGORIES = [
-    "world", "nation", "business", "technology",
-    "entertainment", "sports", "science", "health"
-]
+# ==================== 2. 定义 Gemini 结构化输出 Schema ====================
+class NewsItem(BaseModel):
+    news_id: str = Field(description="对应原始新闻池中的编号，如 N1, N15")
+    title: str = Field(description="中文精炼标题（控制在14-22个汉字以内）")
+    fact: str = Field(description="核心事实与关键数据（控制在40-55个汉字以内，精炼准确）")
+    insight: str = Field(description="商业或行业影响洞察（控制在25-40个汉字以内，一针见血）")
 
 
-# ========== 新闻获取 ==========
-def fetch_news(category: str, max_articles: int = 10) -> list[dict]:
-    """调用 GNews API 获取新闻"""
-    url = "https://gnews.io/api/v4/top-headlines"
-    params = {
-        "lang": "zh",           # 建议改回中文，以获取繁体中文新闻
-        "max": max_articles,
-        "apikey": GNEWS_API_KEY,
+class CategoryBlock(BaseModel):
+    category_index: int = Field(description="分类序号，严格为 1 到 5")
+    category_title: str = Field(description="分类标题，如：全球宏观与地缘政经")
+    summary_line: str = Field(description="该领域今日一句话风向综述（控制在28个汉字以内）")
+    items: List[NewsItem] = Field(description="该分类下精选的 3 到 4 条核心新闻")
+
+
+class DailyIntelligenceReport(BaseModel):
+    top_3_highlights: List[str] = Field(
+        description="全天跨领域最重磅的 3 条核心要闻速览，每条控制在 30 个汉字以内"
+    )
+    categories: List[CategoryBlock] = Field(
+        description="严格按顺序排列的 5 个分类情报块（序号 1 到 5）"
+    )
+
+
+# ==================== 3. 抓取新闻并建立短编号映射 ====================
+def fetch_recent_news() -> tuple[str, dict]:
+    """抓取过去24小时新闻，用 N1, N2... 编号代替长 URL 喂给 AI，节省 Token 并防止链接损坏"""
+    print("开始抓取全球 5 大分类新闻源...")
+    now = datetime.now(timezone.utc)
+    cutoff_time = now - timedelta(hours=26)
+
+    collected_sections = []
+    seen_titles = set()
+    url_map = {}
+    counter = 1
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     }
 
-    # 根据分类名称，设置不同的请求参数
-    if category == "台湾新闻":
-        params["country"] = "tw"  # 添加台湾地区代码
-        params["q"] = "台灣"       # 可选：添加关键词让结果更精准
-    elif category == "香港新闻":
-        params["country"] = "hk"  # 添加香港地区代码
-        params["q"] = "香港"       # 可选：添加关键词让结果更精准
-    elif category in GNEWS_STANDARD_CATEGORIES:
-        params["category"] = category
-    else:
-        params["q"] = category
+    for category_key, urls in RSS_FEEDS.items():
+        cat_items = []
+        for url in urls:
+            try:
+                resp = requests.get(url, headers=headers, timeout=15)
+                feed = feedparser.parse(resp.content)
+                for entry in feed.entries[:MAX_ITEMS_PER_FEED]:
+                    title = entry.get("title", "").strip()
+                    link = entry.get("link", "").strip()
+                    summary = entry.get("summary", "").strip()
 
-    # ... 后续的请求代码不变
+                    if not title or title in seen_titles:
+                        continue
 
+                    pub_parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+                    if pub_parsed:
+                        pub_dt = datetime.fromtimestamp(time.mktime(pub_parsed), tz=timezone.utc)
+                        if pub_dt < cutoff_time:
+                            continue
+
+                    seen_titles.add(title)
+                    news_id = f"N{counter}"
+                    url_map[news_id] = link
+                    counter += 1
+
+                    clean_summary = summary[:180].replace("\n", " ")
+                    cat_items.append(f"[{news_id}] 标题: {title} | 摘要: {clean_summary}")
+            except Exception as e:
+                print(f"[警告] 抓取源失败 ({url}): {e}")
+
+        if cat_items:
+            collected_sections.append(f"=== 分类候选池：{category_key} ===\n" + "\n".join(cat_items))
+
+    return "\n\n".join(collected_sections), url_map
+
+
+# ==================== 4. 调用 Gemini 生成结构化 5 分类情报 ====================
+def analyze_news_with_ai(raw_news_text: str) -> DailyIntelligenceReport:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("未检测到 GEMINI_API_KEY 环境变量！")
+
+    client = genai.Client(api_key=api_key)
+    beijing_tz = timezone(timedelta(hours=8))
+    today_str = datetime.now(beijing_tz).strftime("%Y年%m月%d日")
+
+    system_prompt = f"""你是一位顶级的全球商业与科技首席情报官。今天是 {today_str}。
+请从用户提供的 5 大分类原始新闻候选池中，跨源去重、剔除噪音，严格按照指定的 5 个分类整理出今日全球情报：
+- 分类 1：全球宏观与地缘政经
+- 分类 2：商业与金融市场
+- 分类 3：科技与人工智能
+- 分类 4：汽车工业与新能源
+- 分类 5：产业供应链与全球综合
+
+【核心要求】
+1. 每个分类精选 3 到 4 条最具价值的新闻，必须准确填写对应的 `news_id`（如 N12）。
+2. 所有外文内容必须翻译为地道、专业的中文（保留关键行业缩写如 OEM、800V、Fed、LLM、M&A 等）。
+3. 语言务必高度凝练！严格遵守每个字段的字数限制，以便单条分类消息控制在企业微信 2048 字节以内。
+"""
+
+    print("正在调用 Gemini 2.5 Flash 生成结构化 5 分类情报...")
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=f"以下是过去24小时抓取的全球新闻池：\n\n{raw_news_text}",
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.2,
+            response_mime_type="application/json",
+            response_schema=DailyIntelligenceReport,
+        ),
+    )
+    return DailyIntelligenceReport.model_validate_json(response.text)
+
+
+# ==================== 5. 短链接压缩与 2048 字节安全组装器 ====================
+def shorten_url(long_url: str) -> str:
+    """将冗长的 Google News 链接压缩为约 28 字节的短链，大幅节省字节额度"""
+    if not long_url or len(long_url) <= 60:
+        return long_url
     try:
-        resp = requests.get(url, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("articles", [])
-    except Exception as e:
-        print(f"[错误] 获取 {category} 新闻失败: {e}")
-        return []
+        api_url = f"https://tinyurl.com/api-create.php?url={urllib.parse.quote(long_url, safe='')}"
+        resp = requests.get(api_url, timeout=4)
+        if resp.status_code == 200 and resp.text.startswith("http"):
+            return resp.text.strip()
+    except Exception:
+        pass
+    return long_url
 
 
-def fetch_all_news() -> dict[str, list[dict]]:
-    """获取全部五类新闻"""
-    result = {}
-    for name, cat in CATEGORIES.items():
-        print(f"正在获取：{name} ...")
-        result[name] = fetch_news(cat, MAX_PER_CATEGORY)
-        time.sleep(1.2)  # 免费计划限流，避免触发 429
-    return result
+def utf8_len(text: str) -> int:
+    """计算字符串的 UTF-8 字节长度"""
+    return len(text.encode("utf-8"))
 
 
-# ========== 新闻去重 ==========
-def deduplicate_news(articles: list[dict]) -> list[dict]:
-    """按标题归一化后去重"""
-    seen = set()
-    unique = []
-    for art in articles:
-        title = art.get("title", "").strip().lower()
-        normalized = "".join(c for c in title if c.isalnum())
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            unique.append(art)
-    return unique
+def truncate_to_bytes(text: str, max_bytes: int) -> str:
+    """当极端情况超出字节限制时，按完整字符安全截断，绝不产生乱码"""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    suffix = "...(详见原文)".encode("utf-8")
+    cut_bytes = encoded[: max_bytes - len(suffix)]
+    return cut_bytes.decode("utf-8", errors="ignore") + "...(详见原文)"
 
 
-# ========== 格式化输出 ==========
-def format_category_text(category_name: str, articles: list[dict]) -> str:
-    """生成单个分类的文本，消息长度可控"""
-    articles = deduplicate_news(articles)
-    if not articles:
-        return f"======== {category_name} ========\n（暂无新闻）"
+def build_5_wecom_messages(report: DailyIntelligenceReport, url_map: dict) -> List[str]:
+    """将结构化情报组装为 5 条严格小于 2048 字节的独立消息"""
+    beijing_tz = timezone(timedelta(hours=8))
+    today_str = datetime.now(beijing_tz).strftime("%m月%d日")
+    emojis = {1: "🌍", 2: "📈", 3: "🤖", 4: "🚗", 5: "🏭"}
+    messages = []
 
-    lines = [f"======== {category_name} ========\n"]
-    for i, art in enumerate(articles, 1):
-        title = art.get("title", "无标题")
-        source = art.get("source", {}).get("name", "未知来源")
-        url = art.get("url", "")
-        lines.append(f"{i}. {title}\n   来源：{source}  |  {url}\n")
-    return "\n".join(lines)
+    # 确保按 1~5 顺序排列
+    sorted_categories = sorted(report.categories, key=lambda x: x.category_index)
+
+    for idx, cat in enumerate(sorted_categories[:5], start=1):
+        emoji = emojis.get(idx, "📌")
+        lines = []
+
+        # 1. 消息头部
+        if WECOM_MSG_TYPE == "markdown":
+            lines.append(f"**【{idx}/5】{emoji} {cat.category_title} ({today_str})**")
+            lines.append(f"> 💡 **风向**：{cat.summary_line}")
+        else:
+            lines.append(f"【{idx}/5】{emoji} {cat.category_title} ({today_str})")
+            lines.append(f"💡 风向：{cat.summary_line}")
+
+        # 第 1 条消息额外附上全天 3 条最重磅速览
+        if idx == 1 and report.top_3_highlights:
+            lines.append("")
+            lines.append("🔥 **今日全球重磅速览**：" if WECOM_MSG_TYPE == "markdown" else "🔥 今日全球重磅速览：")
+            for h_idx, h_text in enumerate(report.top_3_highlights[:3], start=1):
+                lines.append(f"• {h_text}")
+
+        lines.append("")  # 空行分隔
+
+        # 2. 逐条组装分类新闻，并动态监控 UTF-8 字节数
+        for item_idx, item in enumerate(cat.items, start=1):
+            raw_url = url_map.get(item.news_id, "")
+            short_link = shorten_url(raw_url)
+
+            if WECOM_MSG_TYPE == "markdown":
+                link_part = f" [原文]({short_link})" if short_link else ""
+                item_block_with_link = (
+                    f"**{item_idx}. {item.title}**{link_part}\n"
+                    f"- **事实**：{item.fact}\n"
+                    f"- **洞察**：{item.insight}"
+                )
+                item_block_no_link = (
+                    f"**{item_idx}. {item.title}**\n"
+                    f"- **事实**：{item.fact}\n"
+                    f"- **洞察**：{item.insight}"
+                )
+            else:
+                link_part = f"\n🔗 {short_link}" if short_link else ""
+                item_block_with_link = (
+                    f"{item_idx}. 【{item.title}】\n"
+                    f"• 事实：{item.fact}\n"
+                    f"• 洞察：{item.insight}{link_part}"
+                )
+                item_block_no_link = (
+                    f"{item_idx}. 【{item.title}】\n"
+                    f"• 事实：{item.fact}\n"
+                    f"• 洞察：{item.insight}"
+                )
+
+            current_text = "\n".join(lines)
+            # 优先尝试带链接的版本
+            candidate_with_link = f"{current_text}\n\n{item_block_with_link}"
+            if utf8_len(candidate_with_link) <= MAX_WECOM_BYTES:
+                lines.append(item_block_with_link)
+                lines.append("")
+                continue
+
+            # 若短链服务超时导致原链接过长，则降级为不带链接版本以保全正文
+            candidate_no_link = f"{current_text}\n\n{item_block_no_link}"
+            if utf8_len(candidate_no_link) <= MAX_WECOM_BYTES:
+                lines.append(item_block_no_link)
+                lines.append("")
+            else:
+                # 兜底截断保护
+                remaining_bytes = MAX_WECOM_BYTES - utf8_len(current_text) - 4
+                if remaining_bytes > 90:
+                    lines.append(truncate_to_bytes(item_block_no_link, remaining_bytes))
+                break
+
+        final_msg = truncate_to_bytes("\n".join(lines).strip(), MAX_WECOM_BYTES)
+        messages.append(final_msg)
+
+    return messages
 
 
-# ========== 推送：企业微信 ==========
-def push_to_wecom(text: str):
-    """推送到企业微信群机器人"""
-    if not WECOM_WEBHOOK:
-        return
-    payload = {
-        "msgtype": "text",
-        "text": {"content": text[:2000]},  # 强制截断到 2000 字节以内
-    }
-    try:
-        resp = requests.post(WECOM_WEBHOOK, json=payload, timeout=10)
-        print(f"[企业微信] 发送结果: {resp.json()}")
-    except Exception as e:
-        print(f"[企业微信] 发送失败: {e}")
-    time.sleep(0.5)
+# ==================== 6. 依次发送 5 条消息至企业微信 ====================
+def push_5_messages_to_wecom(messages: List[str]):
+    webhook_url = os.environ.get("WECOM_WEBHOOK_URL")
+    if not webhook_url:
+        raise ValueError("未检测到 WECOM_WEBHOOK_URL 环境变量！")
+
+    total = len(messages)
+    print(f"准备向企业微信依次发送 {total} 条分类消息（模式: {WECOM_MSG_TYPE}）...")
+
+    for idx, msg in enumerate(messages, start=1):
+        byte_size = utf8_len(msg)
+        if WECOM_MSG_TYPE == "markdown":
+            payload = {
+                "msgtype": "markdown",
+                "markdown": {"content": msg}
+            }
+        else:
+            payload = {
+                "msgtype": "text",
+                "text": {"content": msg}
+            }
+
+        resp = requests.post(webhook_url, json=payload, timeout=15)
+        resp_json = resp.json() if resp.status_code == 200 else {}
+        errcode = resp_json.get("errcode", -1)
+
+        print(
+            f"-> 第 [{idx}/{total}] 条推送完成 | "
+            f"字节数: {byte_size}/2048 Bytes | "
+            f"状态码: {resp.status_code} | 返回结果: {resp.text}"
+        )
+
+        if errcode != 0:
+            print(f"[错误告警] 第 {idx} 条消息发送异常，请检查上方返回结果！")
+
+        # 间隔 1.5 秒，确保 5 条消息在企业微信群中严格按 [1/5] -> [5/5] 顺序排列
+        if idx < total:
+            time.sleep(1.5)
 
 
-# ========== 推送：飞书（备用） ==========
-def gen_feishu_sign(secret: str) -> tuple[str, str]:
-    timestamp = str(int(time.time()))
-    s = f"{timestamp}\n{secret}"
-    h = hmac.new(s.encode("utf-8"), digestmod=hashlib.sha256).digest()
-    sign = base64.b64encode(h).decode("utf-8")
-    return timestamp, sign
-
-
-def push_to_feishu(text: str):
-    if not FEISHU_WEBHOOK:
-        return
-    body = {
-        "msg_type": "text",
-        "content": {"text": text[:2000]},
-    }
-    if FEISHU_SECRET:
-        ts, sign = gen_feishu_sign(FEISHU_SECRET)
-        body["timestamp"] = ts
-        body["sign"] = sign
-    try:
-        resp = requests.post(FEISHU_WEBHOOK, json=body, timeout=10)
-        print(f"[飞书] 发送结果: {resp.json()}")
-    except Exception as e:
-        print(f"[飞书] 发送失败: {e}")
-
-
-# ========== 推送：邮件（备用） ==========
-def push_to_email(content: str):
-    if not EMAIL_SMTP_SERVER or not EMAIL_USERNAME or not EMAIL_TO:
-        return
-    msg = MIMEText(content, "plain", "utf-8")
-    msg["Subject"] = Header(f"每日新闻简报 {datetime.now().strftime('%Y-%m-%d')}", "utf-8")
-    msg["From"] = EMAIL_USERNAME
-    msg["To"] = EMAIL_TO
-    try:
-        with smtplib.SMTP_SSL(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT, timeout=30) as smtp:
-            smtp.login(EMAIL_USERNAME, EMAIL_PASSWORD)
-            smtp.send_message(msg)
-        print("[邮件] 发送成功")
-    except Exception as e:
-        print(f"[邮件] 发送失败: {e}")
-
-
-# ========== 主流程 ==========
 def main():
-    print("=" * 50)
-    print(f"开始执行新闻推送 {datetime.now(timezone.utc).isoformat()}")
-    print("=" * 50)
-
-    if not GNEWS_API_KEY:
-        print("[致命错误] 没有找到 GNEWS_API_KEY，请检查 GitHub Secrets 配置！")
+    raw_news_text, url_map = fetch_recent_news()
+    if not raw_news_text.strip():
+        print("未抓取到过去 24 小时的有效新闻，程序退出。")
         return
 
-    # 1. 获取新闻
-    news = fetch_all_news()
-
-    # 2. 逐类推送，避免长消息被截断
-    for category_name, articles in news.items():
-        # 格式化这一类新闻
-        text_content = format_category_text(category_name, articles)
-        
-        print(f"\n正在推送：{category_name}（{len(deduplicate_news(articles))} 条）")
-        
-        # 推送到各渠道
-        push_to_wecom(text_content)
-        push_to_feishu(text_content)
-    
-    # 邮件可以发一封完整的（如果需要）
-    # full_content = "\n\n".join([format_category_text(k, v) for k, v in news.items()])
-    # push_to_email(full_content)
-
-    print("\n执行完毕。")
+    report = analyze_news_with_ai(raw_news_text)
+    messages = build_5_wecom_messages(report, url_map)
+    push_5_messages_to_wecom(messages)
+    print("✅ 今日 5 条分类情报全部推送完毕！")
 
 
 if __name__ == "__main__":
