@@ -2,15 +2,20 @@ name: Daily AI News Intelligence (9AM & 7PM)
 
 on:
   schedule:
-    # 北京时间早上 09:00 (UTC 01:00)
-    - cron: '0 1 * * *'
-    # 北京时间晚上 19:00 (UTC 11:00)
-    - cron: '0 11 * * *'
-  workflow_dispatch: # 支持手动点击按钮立即测试
+    # 错峰技巧：设为 53 分触发，完美避开全球 00 分整点排队拥堵！
+    # UTC 00:53 = 北京时间早上 08:53（跑完刚好约 08:55-09:00 送达）
+    - cron: '53 0 * * *'
+    # UTC 10:53 = 北京时间晚上 18:53（跑完刚好约 18:55-19:00 送达）
+    - cron: '53 10 * * *'
+  workflow_dispatch: # 手动点击按钮测试时不受时间限制
 
-# 赋予工作流将去重记录文件写回仓库的权限
 permissions:
   contents: write
+
+# 防止同一任务排队叠加运行
+concurrency:
+  group: daily-news-push-group
+  cancel-in-progress: true
 
 jobs:
   build-and-push-news:
@@ -32,14 +37,15 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python main.py
 
-      - name: 5. 保存已推送记录回仓库（防止晚报与早报重复 + 仓库永久保活）
+      - name: 5. 保存已推送记录回仓库
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           if [ -f sent_history.json ]; then
             git add sent_history.json
-            git diff --staged --quiet || git commit -m "chore: 自动更新早晚报去重历史记录 [skip ci]"
+            git diff --staged --quiet || git commit -m "chore: update sent_history [skip ci]"
             git push
           fi
