@@ -245,4 +245,400 @@ def fetch_recent_news(seen_fingerprints: set) -> tuple[str, dict, dict, dict]:
                         # 2. 历史去重审查
                         title_fp = make_fingerprint(title)
                         link_fp = make_fingerprint(link) if link else ""
-                        if title_fp in seen_fingerprints or (link_fp and link
+                        if title_fp in seen_fingerprints or (link_fp and link_fp in seen_fingerprints):
+                            skipped_history_count += 1
+                            continue
+
+                        hours_ago = max(0.1, round((now - pub_dt).total_seconds() / 3600, 1))
+                        current_run_titles.add(title)
+
+                        # 【核心改造】打上 EN_ 或 ZH_ 专属语种编号
+                        if lang_code == "en":
+                            news_id = f"EN_{en_counter}"
+                            en_counter += 1
+                        else:
+                            news_id = f"ZH_{zh_counter}"
+                            zh_counter += 1
+
+                        url_map[news_id] = link
+                        raw_title_map[news_id] = title
+                        lang_map[news_id] = lang_code
+
+                        clean_summary = summary[:140].replace("\n", " ").replace("\r", " ")
+                        line_str = f"[{news_id}] ({hours_ago}h前) 标题: {title} | 摘要: {clean_summary}"
+
+                        if lang_code == "en":
+                            en_items.append(line_str)
+                        else:
+                            zh_items.append(line_str)
+                except Exception as e:
+                    print(f"[警告] 抓取源跳过 ({url[:45]}...): {e}")
+
+        # 控制每个分类喂给 AI 的中英候选数量均衡（各最多取 12 条）
+        en_slice = en_items[:12]
+        zh_slice = zh_items[:12]
+
+        if en_slice or zh_slice:
+            section_text = f"=== 分类候选池：{category_key} ===\n"
+            if en_slice:
+                section_text += "【🌐 英文外媒候选 (编号 EN_开头)】:\n" + "\n".join(en_slice) + "\n"
+            if zh_slice:
+                section_text += "【🇨🇳 中文媒体候选 (编号 ZH_开头)】:\n" + "\n".join(zh_slice)
+            collected_sections.append(section_text.strip())
+        else:
+            print(f"ℹ️ 分类 [{category_key}] 本时段无满足 {MAX_NEWS_AGE_HOURS} 小时内的新鲜资讯。")
+
+    print(
+        f"✅ 双池抓取完成：英文外媒 {en_counter - 1} 条 + 中文媒体 {zh_counter - 1} 条 | "
+        f"拦截超期/无日期旧闻: {skipped_old_or_nodate_count} 条 | "
+        f"拦截往期重复: {skipped_history_count} 条。"
+    )
+    return "\n\n".join(collected_sections), url_map, raw_title_map, lang_map
+
+
+# ==================== 4. 调用 Gemini 生成情报（强制 1:1 中英配额 + 中文精译） ====================
+def discover_available_flash_models(client: genai.Client) -> List[str]:
+    discovered = []
+    try:
+        for m in client.models.list():
+            name = (m.name or "").removeprefix("models/")
+            if "flash" in name and not any(
+                skip in name for skip in ["2.0", "2.5", "tts", "image", "audio", "live", "thinking"]
+            ):
+                discovered.append(name)
+    except Exception:
+        pass
+    return discovered
+
+
+def get_edition_label() -> tuple[str, str]:
+    beijing_tz = timezone(timedelta(hours=8))
+    now_bj = datetime.now(beijing_tz)
+    date_str = now_bj.strftime("%m月%d日")
+    if now_bj.hour < 14:
+        return date_str, "🌅 早报"
+    else:
+        return date_str, "🌙 晚报"
+
+
+def analyze_news_with_ai(raw_news_text: str, recent_ai_titles: List[str]) -> dict:
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        print("❌ [错误] 未检测到 GEMINI_API_KEY 环境变量！")
+        sys.exit(1)
+
+    client = genai.Client(api_key=api_key)
+    beijing_tz = timezone(timedelta(hours=8))
+    today_str = datetime.now(beijing_tz).strftime("%Y年%m月%d日 %H:%M")
+
+    dedup_instruction = ""
+    if recent_ai_titles:
+        joined_titles = "\n".join(f"- {t}" for t in recent_ai_titles)
+        dedup_instruction = f"""
+【🚨 跨期严禁重复指令】
+以下是近期已经向用户推送过的事件清单。即使候选池中有其他媒体换角度再次报道以下同一事件，也**必须坚决剔除**：
+{joined_titles}
+"""
+
+    system_prompt = f"""你是一位精通中英双语的全球商业、科技与舆情首席情报官。当前北京时间是 {today_str}。
+请从用户提供的“中英双池”候选新闻中，跨源去重、剔除噪音，严格输出 JSON 格式的今日全球情报。
+{dedup_instruction}
+【🚨 核心铁律：50% 英文外媒 + 50% 中文媒体配额 & 专业中文翻译】
+1. **中英对半硬性配额（1:1 比例）**：
+   - 候选池中的新闻已明确分为 `EN_数字`（英文外媒）和 `ZH_数字`（中文媒体）。
+   - 在每个分类挑选 2~4 条新闻时，**必须严格执行一半来自 `EN_` 英文源、一半来自 `ZH_` 中文源**！（例如：某分类选 2 条，则必须 1 条 `EN_` + 1 条 `ZH_`；选 3~4 条，则至少包含 1~2 条 `EN_` 和 1~2 条 `ZH_`。只有当某分类下某一语种候选为空时才允许例外）。
+   - 全篇报告的总入选新闻中，`EN_` 开头的新闻占比必须达到 **50% 左右**，严禁偷懒只挑中文新闻！
+2. **强制信达雅中文翻译**：
+   - 所有选中的 `EN_` 英文外媒新闻，其 `title`（标题）、`fact`（核心事实）、`insight`（洞察）**必须全部翻译为地道、流畅、专业的简体中文**！严禁直接输出英文长句（可保留公认行业缩写如 Fed、OEM、800V、LLM、M&A、UFC、NBA 等）。
+3. **宁缺毋滥与防幻觉**：
+   - 严禁脱离候选池编造新闻！`news_id` 必须原样填写如 `"EN_12"` 或 `"ZH_5"`。
+   - 若某分类下没有任何有价值的新鲜动态，直接将该分类的 `items` 设为空数组 `[]`。
+
+【必须严格输出的 JSON 格式示例】
+{{
+  "top_3_highlights": [
+    "本期最重磅要闻1（26字以内，全中文）",
+    "本期最重磅要闻2（26字以内，全中文）",
+    "本期最重磅要闻3（26字以内，全中文）"
+  ],
+  "categories": [
+    {{
+      "category_index": 1,
+      "category_title": "全球宏观与地缘政经",
+      "summary_line": "该领域本期一句话风向综述（24字以内，全中文）",
+      "items": [
+        {{
+          "news_id": "EN_3",
+          "title": "外媒新闻翻译后的中文精炼标题（18字以内，不加星号）",
+          "fact": "翻译后的中文核心事实或数据（40字以内）",
+          "insight": "舆论倾向或行业影响洞察（32字以内）"
+        }},
+        {{
+          "news_id": "ZH_2",
+          "title": "中文媒体新闻的精炼标题（18字以内，不加星号）",
+          "fact": "核心事实或讨论焦点（40字以内）",
+          "insight": "舆论倾向或行业影响洞察（32字以内）"
+        }}
+      ]
+    }}
+  ]
+}}
+
+【分类序号对照表】
+1: 全球宏观与地缘政经 | 2: 商业与金融市场 | 3: 科技与人工智能 | 4: 汽车工业与新能源 | 5: X平台热点与全网讨论 | 6: 港澳台地区动态 | 7: 全球体育赛事 | 8: 文娱与影视音乐 | 9: 产业供应链与全球综合
+"""
+
+    models_to_try = list(CANDIDATE_MODELS)
+    for dm in discover_available_flash_models(client):
+        if dm not in models_to_try:
+            models_to_try.append(dm)
+
+    last_error = None
+    for model_name in models_to_try:
+        try:
+            print(f"正在调用模型 [{model_name}] 进行 1:1 中英配额筛选与中文精译...")
+            response = client.models.generate_content(
+                model=model_name,
+                contents=f"以下是过去 {MAX_NEWS_AGE_HOURS} 小时内抓取的中英双语候选池：\n\n{raw_news_text}",
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.15,
+                    response_mime_type="application/json",
+                ),
+            )
+            raw_json = (response.text or "").strip()
+            if raw_json.startswith("```"):
+                raw_json = raw_json.strip("`").removeprefix("json").strip()
+            data = json.loads(raw_json)
+            print(f"✅ 模型 [{model_name}] 筛选与翻译完成！")
+            return data
+        except Exception as e:
+            print(f"⚠️ 模型 [{model_name}] 调用失败: {e}")
+            last_error = e
+            time.sleep(2)
+
+    print(f"❌ 所有候选模型均调用失败，最后报错: {last_error}")
+    sys.exit(1)
+
+
+# ==================== 5. 动态组装消息（带 [🌐外媒精译] 与 [🇨🇳中文] 标识） ====================
+def shorten_url(long_url: str) -> str:
+    if not long_url or len(long_url) <= 60:
+        return long_url
+    try:
+        api_url = f"[https://tinyurl.com/api-create.php?url=](https://tinyurl.com/api-create.php?url=){urllib.parse.quote(long_url, safe='')}"
+        resp = requests.get(api_url, timeout=3)
+        if resp.status_code == 200 and resp.text.startswith("http"):
+            return resp.text.strip()
+    except Exception:
+        pass
+    return long_url
+
+
+def utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def truncate_to_bytes(text: str, max_bytes: int) -> str:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    suffix = "...(详见链接)".encode("utf-8")
+    cut_bytes = encoded[: max_bytes - len(suffix)]
+    return cut_bytes.decode("utf-8", errors="ignore") + "...(详见链接)"
+
+
+def build_dynamic_wechat_messages(
+    report: dict, url_map: dict, raw_title_map: dict, lang_map: dict
+) -> tuple[List[str], List[str], List[str], List[str]]:
+    date_str, edition_tag = get_edition_label()
+
+    emojis = {1: "🌍", 2: "📈", 3: "🤖", 4: "🚗", 5: "🐦", 6: "🇭🇰", 7: "⚽", 8: "🎬", 9: "🏭"}
+    num_icons = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣"}
+    messages = []
+
+    used_raw_titles = []
+    used_raw_urls = []
+    ai_generated_titles = []
+
+    en_selected_count = 0
+    zh_selected_count = 0
+
+    raw_categories = report.get("categories", [])
+    top_3 = report.get("top_3_highlights", [])
+
+    # 只保留真实存在且非空的分类
+    valid_categories = []
+    for cat in sorted(raw_categories, key=lambda x: x.get("category_index", 99)):
+        valid_items = []
+        for item in cat.get("items", []):
+            nid = str(item.get("news_id", "")).strip().upper()
+            if nid in url_map:
+                item["news_id"] = nid
+                valid_items.append(item)
+        if valid_items:
+            cat["items"] = valid_items
+            valid_categories.append(cat)
+
+    total_cats = len(valid_categories)
+
+    for msg_idx, cat in enumerate(valid_categories, start=1):
+        cat_idx = cat.get("category_index", msg_idx)
+        emoji = emojis.get(cat_idx, "📌")
+        cat_title = str(cat.get("category_title", f"分类情报 {msg_idx}")).replace("**", "")
+        summary_line = str(cat.get("summary_line", "本期重点动态汇总")).replace("**", "")
+        items = cat.get("items", [])
+
+        lines = [
+            f"【{msg_idx}/{total_cats}】{emoji} {cat_title} ({date_str} {edition_tag})",
+            f"💡 风向：{summary_line}",
+            "━━━━━━━━━━━━━━"
+        ]
+
+        if msg_idx == 1 and top_3:
+            lines.append(f"🔥 本期全球重磅速览（{edition_tag}）：")
+            for h_text in top_3[:3]:
+                clean_h = str(h_text).replace("**", "")
+                lines.append(f"• {clean_h}")
+            lines.append("━━━━━━━━━━━━━━")
+
+        for item_idx, item in enumerate(items, start=1):
+            news_id = item["news_id"]
+            raw_url = url_map.get(news_id, "")
+            raw_title = raw_title_map.get(news_id, "")
+            source_lang = lang_map.get(news_id, "zh")
+
+            if source_lang == "en":
+                lang_badge = "[🌐外媒]"
+                en_selected_count += 1
+            else:
+                lang_badge = "[🇨🇳中文]"
+                zh_selected_count += 1
+
+            short_link = shorten_url(raw_url)
+            icon = num_icons.get(item_idx, f"{item_idx}.")
+
+            clean_title = str(item.get("title", "")).replace("**", "")
+            clean_fact = str(item.get("fact", "")).replace("**", "")
+            clean_insight = str(item.get("insight", "")).replace("**", "")
+
+            if raw_title:
+                used_raw_titles.append(raw_title)
+            if raw_url:
+                used_raw_urls.append(raw_url)
+            if clean_title:
+                ai_generated_titles.append(clean_title)
+
+            link_line = f"\n🔗 {short_link}" if short_link else ""
+            item_block_with_link = (
+                f"{icon} {lang_badge} {clean_title}\n"
+                f"▸ 事实/话题：{clean_fact}\n"
+                f"▸ 舆论/洞察：{clean_insight}{link_line}"
+            )
+            item_block_no_link = (
+                f"{icon} {lang_badge} {clean_title}\n"
+                f"▸ 事实/话题：{clean_fact}\n"
+                f"▸ 舆论/洞察：{clean_insight}"
+            )
+
+            current_text = "\n".join(lines)
+            candidate_with_link = f"{current_text}\n\n{item_block_with_link}"
+            if utf8_len(candidate_with_link) <= MAX_WECOM_BYTES:
+                lines.append(item_block_with_link)
+                continue
+
+            candidate_no_link = f"{current_text}\n\n{item_block_no_link}"
+            if utf8_len(candidate_no_link) <= MAX_WECOM_BYTES:
+                lines.append(item_block_no_link)
+            else:
+                remaining_bytes = MAX_WECOM_BYTES - utf8_len(current_text) - 4
+                if remaining_bytes > 90:
+                    lines.append(truncate_to_bytes(item_block_no_link, remaining_bytes))
+                break
+
+        header_part = "\n".join(lines[:3])
+        body_items = lines[3:]
+        final_msg = header_part + "\n" + "\n\n".join(body_items)
+        final_msg = truncate_to_bytes(final_msg.strip(), MAX_WECOM_BYTES)
+        messages.append(final_msg)
+
+    print(
+        f"📊 最终入选语种统计：🌐 英文外媒精译 {en_selected_count} 条 | "
+        f"🇨🇳 中文媒体 {zh_selected_count} 条（共 {total_cats} 条分类消息）。"
+    )
+    return messages, used_raw_titles, used_raw_urls, ai_generated_titles
+
+
+# ==================== 6. 依次发送消息至企业微信/个人微信 ====================
+def push_messages_to_wecom(messages: List[str]):
+    webhook_url = os.environ.get("WECOM_WEBHOOK_URL", "").strip()
+    if not webhook_url:
+        print("❌ [错误] 未检测到 WECOM_WEBHOOK_URL 环境变量！")
+        sys.exit(1)
+
+    total = len(messages)
+    if total == 0:
+        print("⚠️ 本期经过严格过滤后无值得推送的新鲜重磅消息，跳过推送。")
+        return
+
+    print(f"准备向企业微信/个人微信依次发送 {total} 条分类纯文本消息...")
+
+    for idx, msg in enumerate(messages, start=1):
+        byte_size = utf8_len(msg)
+        payload = {
+            "msgtype": "text",
+            "text": {
+                "content": msg
+            }
+        }
+
+        resp = requests.post(webhook_url, json=payload, timeout=15)
+        resp_json = resp.json() if resp.status_code == 200 else {}
+        errcode = resp_json.get("errcode", -1)
+
+        print(
+            f"-> 第 [{idx}/{total}] 条推送完成 | "
+            f"字节数: {byte_size}/2048 Bytes | "
+            f"状态码: {resp.status_code} | 返回结果: {resp.text}"
+        )
+
+        if errcode != 0:
+            print(f"❌ [错误告警] 第 {idx} 条消息发送失败，企业微信返回: {resp.text}")
+            sys.exit(1)
+
+        if idx < total:
+            time.sleep(2.5)
+
+
+def main():
+    date_str, edition_tag = get_edition_label()
+    print(f"========== 启动全球情报系统 ({date_str} {edition_tag}) ==========")
+
+    # 1. 加载过去 72 小时已推送记录
+    seen_fingerprints, recent_ai_titles, history_store = load_sent_history()
+
+    # 2. 中英分池抓取过去 15 小时内的新鲜新闻
+    raw_news_text, url_map, raw_title_map, lang_map = fetch_recent_news(seen_fingerprints)
+    if not raw_news_text.strip():
+        print("⚠️ 本时段没有抓取到任何满足 15 小时内的新鲜未推新闻，程序正常结束。")
+        return
+
+    # 3. AI 筛选分析（强制 1:1 中英配额 + 英文自动精译为中文）
+    report = analyze_news_with_ai(raw_news_text, recent_ai_titles)
+
+    # 4. 动态组装非空分类消息
+    messages, used_raw_titles, used_raw_urls, ai_titles = build_dynamic_wechat_messages(
+        report, url_map, raw_title_map, lang_map
+    )
+
+    # 5. 推送至企业微信/个人微信
+    push_messages_to_wecom(messages)
+
+    # 6. 保存已推送记录
+    if ai_titles:
+        save_sent_history(history_store, used_raw_titles, used_raw_urls, ai_titles)
+    print(f"🎉 {date_str} {edition_tag} 情报任务执行完毕！")
+
+
+if __name__ == "__main__":
+    main()
