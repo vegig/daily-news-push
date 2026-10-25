@@ -11,12 +11,12 @@ import requests
 from google import genai
 from google.genai import types
 
-# ==================== 1. 全局参数与中英双池订阅源配置 ====================
-MAX_WECOM_BYTES = 1980          # 企业微信 text 消息 2048 字节红线
+# ==================== 1. 全局参数与中英全球热门订阅源配置 ====================
+MAX_WECOM_BYTES = 1980          # 企业微信 text 消息 2048 字节安全红线
 MAX_ITEMS_PER_FEED = 8          # 每个 RSS 源提取的最大候选条数
 MAX_NEWS_AGE_HOURS = 15         # 严格锁死过去 15 小时内的新鲜资讯
 HISTORY_FILE = "sent_history.json"
-HISTORY_RETENTION_HOURS = 72    # 历史记录保留 72 小时
+HISTORY_RETENTION_HOURS = 72    # 历史记录保留 72 小时，防止跨期重复
 
 CANDIDATE_MODELS = [
     "gemini-3.8-flash",
@@ -38,7 +38,7 @@ def build_google_news_rss(query: str, lang: str = "en-US", country: str = "US") 
     return f"https://news.google.com/rss/search?q={encoded_query}&hl={lang}&gl={country}&ceid={country}:en"
 
 
-# 【核心升级】每个分类显式拆分为 "en"（英文媒体池）与 "zh"（中文媒体池），源头保证 1:1 比例
+# 每个分类同时配置“全球英文主流媒体”与“中文主流媒体”，源头保证全球视野与中英热度均衡
 RSS_FEEDS = {
     "1_全球宏观与地缘政经": {
         "en": [
@@ -94,7 +94,7 @@ RSS_FEEDS = {
     },
     "6_港澳台地区动态": {
         "en": [
-            "https://www.scmp.com/rss/2/feed",  # 南华早报 (SCMP) 英文版
+            "https://www.scmp.com/rss/2/feed",
             build_google_news_rss("Hong Kong OR Macau OR Taiwan economy OR TSMC"),
         ],
         "zh": [
@@ -109,7 +109,7 @@ RSS_FEEDS = {
             build_google_news_rss("Champions League OR NBA OR UFC OR Premier League OR F1"),
         ],
         "zh": [
-            build_google_news_rss("体育赛事 OR 欧冠 OR 英超 OR NBA OR UFC OR 国足 OR 夺冠", lang="zh-CN"),
+            build_google_news_rss("体育赛事 OR 欧冠 OR 英超 OR NBA OR UFC OR 夺冠", lang="zh-CN"),
         ],
     },
     "8_文娱与影视音乐": {
@@ -193,9 +193,9 @@ def save_sent_history(
     print(f"💾 已更新去重记录库 ({HISTORY_FILE})，新增 {len(ai_generated_titles)} 条已推送事件。")
 
 
-# ==================== 3. 中英分池抓取与严格时间戳过滤 ====================
-def fetch_recent_news(seen_fingerprints: set) -> tuple[str, dict, dict, dict]:
-    print(f"开始中英分池抓取全球新闻源（严格锁定过去 {MAX_NEWS_AGE_HOURS} 小时内）...")
+# ==================== 3. 中英均衡抓取与严格时间戳过滤 ====================
+def fetch_recent_news(seen_fingerprints: set) -> tuple[str, dict, dict]:
+    print(f"开始抓取全球中英媒体热门源（严格锁定过去 {MAX_NEWS_AGE_HOURS} 小时内）...")
     now = datetime.now(timezone.utc)
     cutoff_time = now - timedelta(hours=MAX_NEWS_AGE_HOURS)
 
@@ -203,10 +203,10 @@ def fetch_recent_news(seen_fingerprints: set) -> tuple[str, dict, dict, dict]:
     current_run_titles = set()
     url_map = {}
     raw_title_map = {}
-    lang_map = {}  # 记录每条新闻的原始语种 ("en" 或 "zh")
 
-    en_counter = 1
-    zh_counter = 1
+    counter = 1
+    en_total = 0
+    zh_total = 0
     skipped_history_count = 0
     skipped_old_or_nodate_count = 0
 
@@ -252,51 +252,49 @@ def fetch_recent_news(seen_fingerprints: set) -> tuple[str, dict, dict, dict]:
                         hours_ago = max(0.1, round((now - pub_dt).total_seconds() / 3600, 1))
                         current_run_titles.add(title)
 
-                        # 【核心改造】打上 EN_ 或 ZH_ 专属语种编号
-                        if lang_code == "en":
-                            news_id = f"EN_{en_counter}"
-                            en_counter += 1
-                        else:
-                            news_id = f"ZH_{zh_counter}"
-                            zh_counter += 1
-
+                        news_id = f"N{counter}"
+                        counter += 1
                         url_map[news_id] = link
                         raw_title_map[news_id] = title
-                        lang_map[news_id] = lang_code
 
                         clean_summary = summary[:140].replace("\n", " ").replace("\r", " ")
                         line_str = f"[{news_id}] ({hours_ago}h前) 标题: {title} | 摘要: {clean_summary}"
 
                         if lang_code == "en":
                             en_items.append(line_str)
+                            en_total += 1
                         else:
                             zh_items.append(line_str)
+                            zh_total += 1
                 except Exception as e:
                     print(f"[警告] 抓取源跳过 ({url[:45]}...): {e}")
 
-        # 控制每个分类喂给 AI 的中英候选数量均衡（各最多取 12 条）
-        en_slice = en_items[:12]
-        zh_slice = zh_items[:12]
+        # 源头保持中英候选各占一半（各最多取 10 条），交替排列喂给 AI，消除位置偏见
+        en_slice = en_items[:10]
+        zh_slice = zh_items[:10]
+        interleaved_items = []
+        max_len = max(len(en_slice), len(zh_slice))
+        for i in range(max_len):
+            if i < len(en_slice):
+                interleaved_items.append(en_slice[i])
+            if i < len(zh_slice):
+                interleaved_items.append(zh_slice[i])
 
-        if en_slice or zh_slice:
-            section_text = f"=== 分类候选池：{category_key} ===\n"
-            if en_slice:
-                section_text += "【🌐 英文外媒候选 (编号 EN_开头)】:\n" + "\n".join(en_slice) + "\n"
-            if zh_slice:
-                section_text += "【🇨🇳 中文媒体候选 (编号 ZH_开头)】:\n" + "\n".join(zh_slice)
-            collected_sections.append(section_text.strip())
+        if interleaved_items:
+            section_text = f"=== 分类候选池：{category_key} ===\n" + "\n".join(interleaved_items)
+            collected_sections.append(section_text)
         else:
             print(f"ℹ️ 分类 [{category_key}] 本时段无满足 {MAX_NEWS_AGE_HOURS} 小时内的新鲜资讯。")
 
     print(
-        f"✅ 双池抓取完成：英文外媒 {en_counter - 1} 条 + 中文媒体 {zh_counter - 1} 条 | "
+        f"✅ 全球候选池抓取完成：共 {counter - 1} 条（其中英文媒体 {en_total} 条，中文媒体 {zh_total} 条） | "
         f"拦截超期/无日期旧闻: {skipped_old_or_nodate_count} 条 | "
         f"拦截往期重复: {skipped_history_count} 条。"
     )
-    return "\n\n".join(collected_sections), url_map, raw_title_map, lang_map
+    return "\n\n".join(collected_sections), url_map, raw_title_map
 
 
-# ==================== 4. 调用 Gemini 生成情报（强制 1:1 中英配额 + 中文精译） ====================
+# ==================== 4. 调用 Gemini 生成情报（跨语言合并去重 + 全球视野） ====================
 def discover_available_flash_models(client: genai.Client) -> List[str]:
     discovered = []
     try:
@@ -341,25 +339,25 @@ def analyze_news_with_ai(raw_news_text: str, recent_ai_titles: List[str]) -> dic
 """
 
     system_prompt = f"""你是一位精通中英双语的全球商业、科技与舆情首席情报官。当前北京时间是 {today_str}。
-请从用户提供的“中英双池”候选新闻中，跨源去重、剔除噪音，严格输出 JSON 格式的今日全球情报。
+请从用户提供的全球中英混合候选池中，筛选出当日最重磅的热门新闻，严格输出 JSON 格式的全球情报。
 {dedup_instruction}
-【🚨 核心铁律：50% 英文外媒 + 50% 中文媒体配额 & 专业中文翻译】
-1. **中英对半硬性配额（1:1 比例）**：
-   - 候选池中的新闻已明确分为 `EN_数字`（英文外媒）和 `ZH_数字`（中文媒体）。
-   - 在每个分类挑选 2~4 条新闻时，**必须严格执行一半来自 `EN_` 英文源、一半来自 `ZH_` 中文源**！（例如：某分类选 2 条，则必须 1 条 `EN_` + 1 条 `ZH_`；选 3~4 条，则至少包含 1~2 条 `EN_` 和 1~2 条 `ZH_`。只有当某分类下某一语种候选为空时才允许例外）。
-   - 全篇报告的总入选新闻中，`EN_` 开头的新闻占比必须达到 **50% 左右**，严禁偷懒只挑中文新闻！
-2. **强制信达雅中文翻译**：
-   - 所有选中的 `EN_` 英文外媒新闻，其 `title`（标题）、`fact`（核心事实）、`insight`（洞察）**必须全部翻译为地道、流畅、专业的简体中文**！严禁直接输出英文长句（可保留公认行业缩写如 Fed、OEM、800V、LLM、M&A、UFC、NBA 等）。
-3. **宁缺毋滥与防幻觉**：
-   - 严禁脱离候选池编造新闻！`news_id` 必须原样填写如 `"EN_12"` 或 `"ZH_5"`。
-   - 若某分类下没有任何有价值的新鲜动态，直接将该分类的 `items` 设为空数组 `[]`。
+【🚨 核心筛选与跨语言去重铁律】
+1. **跨语言同一事件严格合并（绝不一事两报）**：
+   - 如果同一件新闻事件既被英文媒体报道，又被中文媒体报道，**必须将其合并为 1 条独立新闻**（只保留信息最核心的那一个 `news_id`），**严禁把同一件事分成中英文两条重复输出**！
+2. **中英媒体视野均衡（涵盖全世界）**：
+   - 你的目标是呈现涵盖全世界的当日热门。在整份报告及各个分类中，既要有来自英文外媒报道的国际重大热点，也要有中文媒体关注的核心动态（整体上来源于英文媒体和中文媒体的不同独立事件各占一半左右，不要只挑中文媒体而忽略英文外媒热点）。
+3. **全中文地道精译**：
+   - 所有入选的英文外媒新闻，其 `title`（标题）、`fact`（核心事实）、`insight`（洞察）**必须全部翻译为地道、流畅、专业的简体中文**（可保留公认缩写如 Fed、OEM、800V、LLM、M&A、UFC、NBA 等）。
+4. **宁缺毋滥与防幻觉**：
+   - 每个分类精选 1 到 3 条互不重复的独立热点事件。如果某分类下只有 1 条真新闻就只输出 1 条，如果没有值得汇报的新鲜动态，直接将该分类的 `items` 设为空数组 `[]`。
+   - 严禁脱离候选池编造新闻！`news_id` 必须原样填写如 `"N12"`。
 
 【必须严格输出的 JSON 格式示例】
 {{
   "top_3_highlights": [
-    "本期最重磅要闻1（26字以内，全中文）",
-    "本期最重磅要闻2（26字以内，全中文）",
-    "本期最重磅要闻3（26字以内，全中文）"
+    "本期全球最重磅要闻1（26字以内，全中文）",
+    "本期全球最重磅要闻2（26字以内，全中文）",
+    "本期全球最重磅要闻3（26字以内，全中文）"
   ],
   "categories": [
     {{
@@ -368,16 +366,10 @@ def analyze_news_with_ai(raw_news_text: str, recent_ai_titles: List[str]) -> dic
       "summary_line": "该领域本期一句话风向综述（24字以内，全中文）",
       "items": [
         {{
-          "news_id": "EN_3",
-          "title": "外媒新闻翻译后的中文精炼标题（18字以内，不加星号）",
-          "fact": "翻译后的中文核心事实或数据（40字以内）",
-          "insight": "舆论倾向或行业影响洞察（32字以内）"
-        }},
-        {{
-          "news_id": "ZH_2",
-          "title": "中文媒体新闻的精炼标题（18字以内，不加星号）",
-          "fact": "核心事实或讨论焦点（40字以内）",
-          "insight": "舆论倾向或行业影响洞察（32字以内）"
+          "news_id": "N3",
+          "title": "中文精炼标题（18字以内，不加星号）",
+          "fact": "核心事实或关键数据（40字以内，全中文）",
+          "insight": "舆论倾向或行业影响洞察（32字以内，全中文）"
         }}
       ]
     }}
@@ -396,10 +388,10 @@ def analyze_news_with_ai(raw_news_text: str, recent_ai_titles: List[str]) -> dic
     last_error = None
     for model_name in models_to_try:
         try:
-            print(f"正在调用模型 [{model_name}] 进行 1:1 中英配额筛选与中文精译...")
+            print(f"正在调用模型 [{model_name}] 进行全球热门筛选、跨语种去重与中文精译...")
             response = client.models.generate_content(
                 model=model_name,
-                contents=f"以下是过去 {MAX_NEWS_AGE_HOURS} 小时内抓取的中英双语候选池：\n\n{raw_news_text}",
+                contents=f"以下是过去 {MAX_NEWS_AGE_HOURS} 小时内抓取的全球中英混合候选池：\n\n{raw_news_text}",
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
                     temperature=0.15,
@@ -421,7 +413,7 @@ def analyze_news_with_ai(raw_news_text: str, recent_ai_titles: List[str]) -> dic
     sys.exit(1)
 
 
-# ==================== 5. 动态组装消息（带 [🌐外媒精译] 与 [🇨🇳中文] 标识） ====================
+# ==================== 5. 动态组装消息（干净无标签，严格防超限） ====================
 def shorten_url(long_url: str) -> str:
     if not long_url or len(long_url) <= 60:
         return long_url
@@ -449,7 +441,7 @@ def truncate_to_bytes(text: str, max_bytes: int) -> str:
 
 
 def build_dynamic_wechat_messages(
-    report: dict, url_map: dict, raw_title_map: dict, lang_map: dict
+    report: dict, url_map: dict, raw_title_map: dict
 ) -> tuple[List[str], List[str], List[str], List[str]]:
     date_str, edition_tag = get_edition_label()
 
@@ -461,19 +453,18 @@ def build_dynamic_wechat_messages(
     used_raw_urls = []
     ai_generated_titles = []
 
-    en_selected_count = 0
-    zh_selected_count = 0
-
     raw_categories = report.get("categories", [])
     top_3 = report.get("top_3_highlights", [])
 
-    # 只保留真实存在且非空的分类
+    # 只保留真实存在且非空的分类，并防止同一 news_id 被重复引用
     valid_categories = []
+    used_nids = set()
     for cat in sorted(raw_categories, key=lambda x: x.get("category_index", 99)):
         valid_items = []
         for item in cat.get("items", []):
             nid = str(item.get("news_id", "")).strip().upper()
-            if nid in url_map:
+            if nid in url_map and nid not in used_nids:
+                used_nids.add(nid)
                 item["news_id"] = nid
                 valid_items.append(item)
         if valid_items:
@@ -481,6 +472,7 @@ def build_dynamic_wechat_messages(
             valid_categories.append(cat)
 
     total_cats = len(valid_categories)
+    print(f"📊 经过跨语种去重与过滤后，本期共有 {total_cats} 个分类包含全球热门动态。")
 
     for msg_idx, cat in enumerate(valid_categories, start=1):
         cat_idx = cat.get("category_index", msg_idx)
@@ -506,14 +498,6 @@ def build_dynamic_wechat_messages(
             news_id = item["news_id"]
             raw_url = url_map.get(news_id, "")
             raw_title = raw_title_map.get(news_id, "")
-            source_lang = lang_map.get(news_id, "zh")
-
-            if source_lang == "en":
-                lang_badge = "[🌐外媒]"
-                en_selected_count += 1
-            else:
-                lang_badge = "[🇨🇳中文]"
-                zh_selected_count += 1
 
             short_link = shorten_url(raw_url)
             icon = num_icons.get(item_idx, f"{item_idx}.")
@@ -531,12 +515,12 @@ def build_dynamic_wechat_messages(
 
             link_line = f"\n🔗 {short_link}" if short_link else ""
             item_block_with_link = (
-                f"{icon} {lang_badge} {clean_title}\n"
+                f"{icon} {clean_title}\n"
                 f"▸ 事实/话题：{clean_fact}\n"
                 f"▸ 舆论/洞察：{clean_insight}{link_line}"
             )
             item_block_no_link = (
-                f"{icon} {lang_badge} {clean_title}\n"
+                f"{icon} {clean_title}\n"
                 f"▸ 事实/话题：{clean_fact}\n"
                 f"▸ 舆论/洞察：{clean_insight}"
             )
@@ -562,10 +546,6 @@ def build_dynamic_wechat_messages(
         final_msg = truncate_to_bytes(final_msg.strip(), MAX_WECOM_BYTES)
         messages.append(final_msg)
 
-    print(
-        f"📊 最终入选语种统计：🌐 英文外媒精译 {en_selected_count} 条 | "
-        f"🇨🇳 中文媒体 {zh_selected_count} 条（共 {total_cats} 条分类消息）。"
-    )
     return messages, used_raw_titles, used_raw_urls, ai_generated_titles
 
 
@@ -617,18 +597,18 @@ def main():
     # 1. 加载过去 72 小时已推送记录
     seen_fingerprints, recent_ai_titles, history_store = load_sent_history()
 
-    # 2. 中英分池抓取过去 15 小时内的新鲜新闻
-    raw_news_text, url_map, raw_title_map, lang_map = fetch_recent_news(seen_fingerprints)
+    # 2. 从全球中英主流媒体均衡抓取过去 15 小时内的新鲜热门资讯
+    raw_news_text, url_map, raw_title_map = fetch_recent_news(seen_fingerprints)
     if not raw_news_text.strip():
         print("⚠️ 本时段没有抓取到任何满足 15 小时内的新鲜未推新闻，程序正常结束。")
         return
 
-    # 3. AI 筛选分析（强制 1:1 中英配额 + 英文自动精译为中文）
+    # 3. AI 筛选全球热点（跨语言合并同一事件 + 英文自动精译为中文）
     report = analyze_news_with_ai(raw_news_text, recent_ai_titles)
 
     # 4. 动态组装非空分类消息
     messages, used_raw_titles, used_raw_urls, ai_titles = build_dynamic_wechat_messages(
-        report, url_map, raw_title_map, lang_map
+        report, url_map, raw_title_map
     )
 
     # 5. 推送至企业微信/个人微信
