@@ -600,7 +600,6 @@ def push_messages_to_wecom(messages: List[str]):
 def main():
     beijing_tz = timezone(timedelta(hours=8))
     now_bj = datetime.now(beijing_tz)
-    current_hour = now_bj.hour
     event_name = os.environ.get("GITHUB_EVENT_NAME", "manual").strip()
     is_manual_test = (event_name != "schedule")
 
@@ -608,38 +607,22 @@ def main():
     print(f"========== 启动全球情报系统 ({now_bj.strftime('%Y-%m-%d %H:%M:%S')} {edition_tag}) ==========")
     print(f"触发事件类型: {event_name} | 是否手动测试模式: {is_manual_test}")
 
-    # 只有在 schedule 自动定时触发时，才启用夜间静音保护
-    if event_name == "schedule":
-        is_morning_window = (8 <= current_hour <= 11)
-        is_evening_window = (18 <= current_hour <= 21)
-        if not (is_morning_window or is_evening_window):
-            print(
-                f"🛑 [夜间静音保护] 当前北京时间为 {now_bj.strftime('%H:%M')}，"
-                f"不在早晚报合法推送窗口（08:00-11:59 或 18:00-21:59）内，已取消本次自动推送！"
-            )
-            return
-
-    # 1. 加载去重记录（如果是手动点击 Run workflow 测试，自动豁免历史拦截！）
+    # 【已彻底移除时间窗口拦截锁】只要触发运行，100% 正常抓取并推送！
     seen_fingerprints, recent_ai_titles, history_store = load_sent_history(is_manual_test)
 
-    # 2. 从全球中英主流媒体均衡抓取新鲜热门资讯
     raw_news_text, url_map, raw_title_map = fetch_recent_news(seen_fingerprints)
     if not raw_news_text.strip():
         print("❌ 本时段未抓取到任何未推新闻！")
         sys.exit(1)
 
-    # 3. AI 筛选全球热点（跨语言合并同一事件 + 英文自动精译为中文）
     report = analyze_news_with_ai(raw_news_text, recent_ai_titles)
 
-    # 4. 动态组装消息（带智能编号修复）
     messages, used_raw_titles, used_raw_urls, ai_titles = build_dynamic_wechat_messages(
         report, url_map, raw_title_map
     )
 
-    # 5. 推送至企业微信/个人微信
     push_messages_to_wecom(messages)
 
-    # 6. 保存已推送记录
     if ai_titles:
         save_sent_history(history_store, used_raw_titles, used_raw_urls, ai_titles)
     print(f"🎉 {date_str} {edition_tag} 情报任务全部推送完毕！")
