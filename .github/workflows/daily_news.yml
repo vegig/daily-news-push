@@ -2,12 +2,11 @@ name: Daily AI News Intelligence (9AM & 7PM)
 
 on:
   schedule:
-    # 错峰技巧：设为 53 分触发，完美避开全球 00 分整点排队拥堵！
-    # UTC 00:53 = 北京时间早上 08:53（跑完刚好约 08:55-09:00 送达）
-    - cron: '53 0 * * *'
-    # UTC 10:53 = 北京时间晚上 18:53（跑完刚好约 18:55-19:00 送达）
-    - cron: '53 10 * * *'
-  workflow_dispatch: # 手动点击按钮测试时不受时间限制
+    # 提前 5 小时排入队列，抵消 GitHub 延迟，实际会在北京时间早上 08:30-09:30 启动
+    - cron: '45 19 * * *'
+    # 提前 5 小时排入队列，抵消 GitHub 延迟，实际会在北京时间晚上 18:30-19:30 启动
+    - cron: '45 5 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
